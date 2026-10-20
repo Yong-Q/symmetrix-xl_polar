@@ -40,12 +40,18 @@ const nlohmann::json& checked_interaction(const nlohmann::json& data)
     return data;
 }
 
+bool readout_is_nonlinear(const std::string& readout_class)
+{
+    return readout_class == "NonLinearReadoutBlock"
+        || readout_class == "NonLinearBiasReadoutBlock";
+}
+
 const nlohmann::json& readout_linear(const nlohmann::json& data)
 {
     const auto readout_class = data.at("class").get<std::string>();
     if (readout_class == "LinearReadoutBlock")
         return data.at("linear");
-    if (readout_class == "NonLinearReadoutBlock")
+    if (readout_is_nonlinear(readout_class))
         return data.at("linear_1");
     throw std::invalid_argument(
         "MACE_Nonlinear readout class is unsupported: " + readout_class);
@@ -216,7 +222,7 @@ void MaceNonlinear::Interaction::validate_conditioned_type(int type) const
 }
 
 MaceNonlinear::Readout::Readout(const nlohmann::json& data)
-    : nonlinear(data.at("class").get<std::string>() == "NonLinearReadoutBlock"),
+    : nonlinear(readout_is_nonlinear(data.at("class").get<std::string>())),
       linear(readout_linear(data)),
       activation_constant(1.0)
 {
@@ -226,6 +232,8 @@ MaceNonlinear::Readout::Readout(const nlohmann::json& data)
         linear_1 = std::make_unique<E3Linear>(data.at("linear_1"));
         linear_2 = std::make_unique<E3Linear>(data.at("linear_2"));
         activation_constant = data.at("activation_constants").at(0).get<double>();
+        if (data.at("class").get<std::string>() == "NonLinearBiasReadoutBlock")
+            linear_mid = std::make_unique<E3Linear>(data.at("linear_mid"));
     }
 }
 
@@ -234,6 +242,11 @@ double MaceNonlinear::Readout::evaluate(const std::vector<double>& features) con
     if (!nonlinear) return linear.evaluate(features).at(0);
     auto hidden = linear_1->evaluate(features);
     for (double& value : hidden) value = activation_constant*silu(value);
+    if (linear_mid) {
+        auto mid = linear_mid->evaluate(hidden);
+        for (double& value : mid) value = activation_constant*silu(value);
+        return linear_2->evaluate(mid).at(0);
+    }
     return linear_2->evaluate(hidden).at(0);
 }
 
@@ -249,6 +262,26 @@ std::vector<double> MaceNonlinear::Readout::reverse(
     auto hidden = linear_1->evaluate(features);
     auto activated = hidden;
     for (double& value : activated) value = activation_constant*silu(value);
+    if (linear_mid) {
+        auto mid = linear_mid->evaluate(activated);
+        std::vector<double> mid_adjoint;
+        linear_2->reverse({output_adjoint}, mid_adjoint);
+        for (int index=0; index<static_cast<int>(mid.size()); ++index) {
+            const double probability = sigmoid(mid[index]);
+            mid_adjoint[index] *= activation_constant
+                *(probability+mid[index]*probability*(1.0-probability));
+        }
+        std::vector<double> activated_adjoint;
+        linear_mid->reverse(mid_adjoint, activated_adjoint);
+        for (int index=0; index<static_cast<int>(hidden.size()); ++index) {
+            const double probability = sigmoid(hidden[index]);
+            activated_adjoint[index] *= activation_constant
+                *(probability+hidden[index]*probability*(1.0-probability));
+        }
+        std::vector<double> result;
+        linear_1->reverse(activated_adjoint, result);
+        return result;
+    }
     std::vector<double> activated_adjoint;
     linear_2->reverse({output_adjoint}, activated_adjoint);
     for (int index=0; index<static_cast<int>(hidden.size()); ++index) {

@@ -40,6 +40,7 @@ PairStyle(symmetrix/mace/float32/kk/host,PairSymmetrixMACEKokkosHostFloat);
 #include "neigh_list_kokkos.h"
 
 #include "mace_kokkos.hpp"
+#include "mace_nonlinear_kokkos.hpp"
 
 namespace LAMMPS_NS {
 
@@ -67,6 +68,8 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   void compute_no_domain_decomposition(int, int);
   void compute_mpi_message_passing(int, int);
  void compute_no_mpi_message_passing(int, int);
+  void compute_polar_mpi(int, int);
+  void compute_polar_mpi_message_passing(int, int);
 
  protected:
   std::string mode;
@@ -108,10 +111,43 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   double execution_mpi_staged_packet_h2d_bytes = 0.0;
   double execution_mpi_staged_index_h2d_bytes = 0.0;
   bool electric_field_set;
+  // Opt-in H1/MPI profiler (MATOS_MPI_PROFILE=1).  The wall-clock accounting
+  // is only touched when the env var was set at construction, so production
+  // runs pay a single bool test per pair evaluation.
+  bool mpi_profile = false;
+  double mpi_profile_graph_ms = 0.0;
+  double mpi_profile_engine_ms = 0.0;
+  double mpi_profile_fwd_d2h_ms = 0.0;
+  double mpi_profile_fwd_comm_ms = 0.0;
+  double mpi_profile_fwd_h2d_ms = 0.0;
+  double mpi_profile_rev_d2h_ms = 0.0;
+  double mpi_profile_rev_comm_ms = 0.0;
+  double mpi_profile_rev_h2d_ms = 0.0;
+  double mpi_profile_reduce_ms = 0.0;
+  double mpi_profile_call_ms = 0.0;
+  int mpi_profile_calls = 0;
+  int mpi_profile_fwd_syncs = 0;
+  int mpi_profile_rev_syncs = 0;
   std::unique_ptr<MACEKokkos<Precision>> mace;
+  // MACE_Nonlinear / PolarMACE path (P5). Exactly one of mace / mace_nonlinear
+  // is populated, selected by the JSON model_type in coeff().
+  std::unique_ptr<MaceNonlinearKokkosT<Precision>> mace_nonlinear;
+  bool is_polar_model = false;
+  bool polar_mpi_ghost_one_hop = false;
+  double polar_total_charge = 0.0;
+  double polar_total_spin = 1.0;
+  Kokkos::View<double*> polar_cell;
+  Kokkos::View<double*> polar_node_positions;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> polar_sync_device;
+  Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::HostSpace> polar_sync_host;
+  int polar_comm_width = 0;
   Kokkos::View<int*> mace_types;
   Kokkos::View<double*> electric_field;
   Kokkos::View<Precision***,Kokkos::LayoutRight> H1, H1_adj;
+
+  double model_rcut() const {
+    return is_polar_model ? mace_nonlinear->r_cut : mace->r_cut;
+  }
 
   // neighbor list variables
   Kokkos::View<int*> node_indices;

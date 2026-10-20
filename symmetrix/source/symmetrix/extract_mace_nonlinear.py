@@ -23,6 +23,32 @@ def _tensor(value: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def _scalar_tensor(value: torch.Tensor) -> dict[str, Any]:
+    """Serialize a 1-element tensor as a 0-dim scalar (MACE_Nonlinear schema).
+
+    The native MACE_Nonlinear loader requires ``scale_shift.scale/shift`` with
+    ``shape == []`` (see test/test_mh1.py::test_mh1_extracts_and_evaluates_each_head).
+    """
+    flat = value.detach().cpu().numpy(force=True).reshape(-1)
+    if flat.size != 1:
+        raise RuntimeError("MACE_Nonlinear scale and shift must be scalar tensors")
+    return {"shape": [], "values": [flat[0].item()]}
+
+
+def _matrix_tensor(value: torch.Tensor) -> dict[str, Any]:
+    """Serialize per-element data as a 2-D [heads, num_elements] matrix.
+
+    The native MACE_Nonlinear loader requires ``atomic_energies`` to be 2-D
+    (MH1 checkpoints store [1, num_elements]; see test/test_mh1.py).  Some
+    checkpoints (e.g. MACE-POLAR-1) store the single-head vector flat, so
+    promote 1-D input to [1, N].
+    """
+    arr = value.detach().cpu().numpy(force=True)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    return {"shape": list(arr.shape), "values": arr.reshape(-1).tolist()}
+
+
 def _instructions(module) -> list[dict[str, Any]]:
     serialized = []
     for instruction in module.instructions:
@@ -50,9 +76,38 @@ def _linear(module) -> dict[str, Any]:
         "irreps_out": str(module.irreps_out),
         "instructions": _instructions(module),
         "weight": _tensor(module.weight),
-        "bias": _tensor(module.bias),
+        "bias": _tensor(_full_width_linear_bias(module)),
         "output_mask": _tensor(module.output_mask),
     }
+
+
+def _full_width_linear_bias(module) -> Any:
+    """e3nn o3.Linear(biases=True) 的 bias 仅覆盖标量(0e)输出块(_linear.py L177-186),
+    常量经 i_in==-1 的 bias 指令消费(_linear.py L412-424);引擎侧契约要求
+    bias.numel()==irreps_out.dimension()(e3nn.cpp L129-130)。部分覆盖时按 bias 指令的
+    i_out 块位置零填充展开为满维;bias 为空或已满维时原样(对现役 MH1 模型零改动)。
+    依据: docs/module7_patch_final.md E1(实测对象 le.linear_up_q/v、charges_maps
+    readout.linear_mid/linear_2)。"""
+    bias = module.bias
+    dimension = module.irreps_out.dim
+    if bias is None or bias.numel() == dimension:
+        return bias
+    expanded = bias.new_zeros(dimension)
+    cursor = 0
+    out_slices = list(module.irreps_out.slices())
+    for instruction in module.instructions:
+        if getattr(instruction, "i_in", None) != -1:
+            continue
+        width = int(instruction.path_shape[0])
+        start = out_slices[int(instruction.i_out)].start
+        expanded[start:start + width] = bias[cursor:cursor + width]
+        cursor += width
+    if cursor != bias.numel():
+        raise RuntimeError(
+            f"linear bias expansion mismatch: consumed {cursor} of "
+            f"{bias.numel()} values (irreps_out={module.irreps_out})"
+        )
+    return expanded
 
 
 def _readout(readout) -> dict[str, Any]:
@@ -60,6 +115,7 @@ def _readout(readout) -> dict[str, Any]:
         "class": type(readout).__name__,
         "linear": _linear(readout.linear) if hasattr(readout, "linear") else None,
         "linear_1": _linear(readout.linear_1) if hasattr(readout, "linear_1") else None,
+        "linear_mid": _linear(readout.linear_mid) if hasattr(readout, "linear_mid") else None,
         "linear_2": _linear(readout.linear_2) if hasattr(readout, "linear_2") else None,
         "activation": "silu" if hasattr(readout, "non_linearity") else None,
         "activation_constants": [
@@ -74,10 +130,10 @@ def extract_mace_nonlinear_head_payload(model) -> dict[str, Any]:
     """Serialize only quantities selected by ``remove_pt_head``."""
 
     return {
-        "atomic_energies": _tensor(model.atomic_energies_fn.atomic_energies),
+        "atomic_energies": _matrix_tensor(model.atomic_energies_fn.atomic_energies),
         "scale_shift": {
-            "scale": _tensor(model.scale_shift.scale),
-            "shift": _tensor(model.scale_shift.shift),
+            "scale": _scalar_tensor(model.scale_shift.scale),
+            "shift": _scalar_tensor(model.scale_shift.shift),
         },
         "readouts": [_readout(readout) for readout in model.readouts],
     }
@@ -321,15 +377,24 @@ def extract_mace_nonlinear_data(
             ],
         }
 
-    from mace.modules.blocks import LinearReadoutBlock, NonLinearReadoutBlock
+    from mace.modules.blocks import (
+        LinearReadoutBlock,
+        NonLinearBiasReadoutBlock,
+        NonLinearReadoutBlock,
+    )
 
     for readout in model.readouts:
-        if type(readout) not in (LinearReadoutBlock, NonLinearReadoutBlock):
+        if type(readout) not in (
+            LinearReadoutBlock,
+            NonLinearReadoutBlock,
+            NonLinearBiasReadoutBlock,
+        ):
             raise RuntimeError(
-                "Native nonlinear-MACE extraction only supports LinearReadoutBlock and "
-                f"NonLinearReadoutBlock; found {type(readout).__name__}."
+                "Native nonlinear-MACE extraction only supports LinearReadoutBlock, "
+                "NonLinearReadoutBlock and NonLinearBiasReadoutBlock; found "
+                f"{type(readout).__name__}."
             )
-        if isinstance(readout, NonLinearReadoutBlock) and not all(
+        if isinstance(readout, (NonLinearReadoutBlock, NonLinearBiasReadoutBlock)) and not all(
             activation.f is torch.nn.functional.silu
             for activation in readout.non_linearity.acts
         ):
@@ -350,10 +415,10 @@ def extract_mace_nonlinear_data(
         "r_cut": float(model.r_max),
         "l_max": int(model.spherical_harmonics._lmax),
         "num_interactions": len(model.interactions),
-        "atomic_energies": _tensor(model.atomic_energies_fn.atomic_energies),
+        "atomic_energies": _matrix_tensor(model.atomic_energies_fn.atomic_energies),
         "scale_shift": {
-            "scale": _tensor(model.scale_shift.scale),
-            "shift": _tensor(model.scale_shift.shift),
+            "scale": _scalar_tensor(model.scale_shift.scale),
+            "shift": _scalar_tensor(model.scale_shift.shift),
         },
         "node_embedding": _linear(model.node_embedding.linear),
         "radial_embedding": {
@@ -377,6 +442,10 @@ def extract_mace_nonlinear_data(
         "readouts": [_readout(readout) for readout in model.readouts],
         "has_zbl": bool(getattr(model, "pair_repulsion", False)),
     }
+    from .extract_polar_blocks import extract_polar_blocks  # 懒导入避免环
+    polar_blocks = extract_polar_blocks(model)
+    if polar_blocks is not None:
+        output["polar_blocks"] = polar_blocks
     execution_contract = maybe_make_execution_mh1_contract(output)
     if execution_contract is not None:
         output["execution_contracts"] = {MH1_CONTRACT_KEY: execution_contract}

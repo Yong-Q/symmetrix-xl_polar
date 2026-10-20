@@ -456,8 +456,22 @@ void bind_mace_nonlinear_kokkos_evaluator(
             [](Evaluator& self,int num_nodes,IntArray node_types,
                     IntArray num_neigh,IntArray neigh_indices,
                     IntArray neigh_types,DoubleArray xyz,
-                    DoubleArray distances) {
+                    DoubleArray distances,
+                    double total_charge,double total_spin,
+                    py::object node_positions,py::object cell) {
                 try {
+                    Kokkos::View<const double*> positions_view,cell_view;
+                    if(!node_positions.is_none()) {
+                        DoubleArray positions=node_positions
+                            .cast<DoubleArray>();
+                        positions_view=create_kokkos_view(
+                            "polar node positions",positions);
+                    }
+                    if(!cell.is_none()) {
+                        DoubleArray cell_array=cell.cast<DoubleArray>();
+                        cell_view=create_kokkos_view(
+                            "polar cell",cell_array);
+                    }
                     self.compute_node_energies_forces(
                         num_nodes,
                         create_kokkos_view("nonlinear node types",node_types),
@@ -465,12 +479,209 @@ void bind_mace_nonlinear_kokkos_evaluator(
                         create_kokkos_view("nonlinear neigh indices",neigh_indices),
                         create_kokkos_view("nonlinear neigh types",neigh_types),
                         create_kokkos_view("nonlinear xyz",xyz),
-                        create_kokkos_view("nonlinear distances",distances));
+                        create_kokkos_view("nonlinear distances",distances),
+                        0,total_charge,total_spin,positions_view,cell_view);
                 } catch (...) {
                     self.fence();
                     throw;
                 }
-            });
+            },
+            py::arg("num_nodes"),py::arg("node_types"),py::arg("num_neigh"),
+            py::arg("neigh_indices"),py::arg("neigh_types"),py::arg("xyz"),
+            py::arg("distances"),py::arg("total_charge")=0.0,
+            py::arg("total_spin")=1.0,py::arg("node_positions")=py::none(),
+            py::arg("cell")=py::none())
+        .def("polar_spin_charge_density",[](const Evaluator& self) {
+            // PolarMACE 模块①中间量(行=节点,8 列平坦序 [sα|xyzα|sβ|xyzβ]);
+            // polar 模型未启用时返回空列表。仅供 P3 逐模块验收门对照。
+            return view2vector(self.polar_spin_charge_density);
+        })
+        .def("polar_fukui_sources",[](const Evaluator& self) {
+            // 模块②: fukui_source_map 原始输出(N×2,未归一)。
+            return view2vector(self.polar_fukui_sources);
+        })
+        .def("polar_field_independent_density",[](const Evaluator& self) {
+            // 模块②: Fukui 校正后的初始密度(N×8;= mace field_independent_spin_charge_density)。
+            return view2vector(self.polar_field_independent_density);
+        })
+        .def("polar_k_vectors",[](const Evaluator& self) {
+            // 模块③: k 网格(Nk×3,半空间枚举)。
+            return view2vector(self.polar_k_vectors);
+        })
+        .def("polar_k_norm2",[](const Evaluator& self) {
+            return view2vector(self.polar_k_norm2);
+        })
+        .def("polar_k0_mask",[](const Evaluator& self) {
+            return view2vector(self.polar_k0_mask);
+        })
+        .def("polar_cosines",[](const Evaluator& self) {
+            // 模块③: cos(k·r)(Nk×N)。
+            return view2vector(self.polar_cosines);
+        })
+        .def("polar_density_basis_re",[](const Evaluator& self) {
+            return view2vector(self.polar_density_basis_re);
+        })
+        .def("polar_density_basis_im",[](const Evaluator& self) {
+            return view2vector(self.polar_density_basis_im);
+        })
+        .def("polar_feature_basis_re",[](const Evaluator& self) {
+            return view2vector(self.polar_feature_basis_re);
+        })
+        .def("polar_feature_basis_im",[](const Evaluator& self) {
+            return view2vector(self.polar_feature_basis_im);
+        })
+        .def("polar_potential_features",[](const Evaluator& self) {
+            // 模块④: 初始密度的势特征 α|β(N×16;含逐通道归一)。
+            return view2vector(self.polar_potential_features);
+        })
+        .def("polar_features_mixed",[](const Evaluator& self) {
+            // 模块⑤: features_mixed(N×2048)。
+            return view2vector(self.polar_features_mixed);
+        })
+        .def("polar_pe_out",[](const Evaluator& self) {
+            return view2vector(self.polar_pe_out);
+        })
+        .def("polar_dp_out",[](const Evaluator& self) {
+            return view2vector(self.polar_dp_out);
+        })
+        .def("polar_se_out",[](const Evaluator& self) {
+            return view2vector(self.polar_se_out);
+        })
+        .def("polar_nl_out",[](const Evaluator& self) {
+            return view2vector(self.polar_nl_out);
+        })
+        .def("polar_tp_out",[](const Evaluator& self) {
+            return view2vector(self.polar_tp_out);
+        })
+        .def("polar_ro_l1_out",[](const Evaluator& self) {
+            return view2vector(self.polar_ro_l1_out);
+        })
+        .def("polar_gate1_out",[](const Evaluator& self) {
+            return view2vector(self.polar_gate1_out);
+        })
+        .def("polar_ro_lmid_out",[](const Evaluator& self) {
+            return view2vector(self.polar_ro_lmid_out);
+        })
+        .def("polar_gate2_out",[](const Evaluator& self) {
+            return view2vector(self.polar_gate2_out);
+        })
+        .def("polar_update_out",[](const Evaluator& self) {
+            // 模块⑤: 更新块输出(N×10 = 前8密度增量 | 后2 Fukui 源)。
+            return view2vector(self.polar_update_out);
+        })
+        .def("polar_scf_step_densities",[](const Evaluator& self) {
+            // 模块⑤: SCF 每步更新后密度(S×N×8;S=num_recursion_steps)。
+            return view2vector(self.polar_scf_step_densities);
+        })
+        .def("polar_scf_final_density",[](const Evaluator& self) {
+            return view2vector(self.polar_scf_final_density);
+        })
+        .def("polar_le_q_in",[](const Evaluator& self) {
+            // 模块⑦: q_in = charges_induced + charges_0(N×8)。
+            return view2vector(self.polar_le_q_in);
+        })
+        .def("polar_le_q_up",[](const Evaluator& self) {
+            // 模块⑦: linear_up_q 输出(N×2048)。
+            return view2vector(self.polar_le_q_up);
+        })
+        .def("polar_le_v_up",[](const Evaluator& self) {
+            // 模块⑦: linear_up_v 输出(N×2048)。
+            return view2vector(self.polar_le_v_up);
+        })
+        .def("polar_le_dot_q",[](const Evaluator& self) {
+            // 模块⑦: uvu 内积 dot_products_q(node_feats, q_up)(N×512)。
+            return view2vector(self.polar_le_dot_q);
+        })
+        .def("polar_le_dot_v",[](const Evaluator& self) {
+            // 模块⑦: uvu 内积 dot_products_v(node_feats, v_up)(N×512)。
+            return view2vector(self.polar_le_dot_v);
+        })
+        .def("polar_le_invar",[](const Evaluator& self) {
+            // 模块⑦: cat(dot_q, dot_v)(N×1024; MLP 输入)。
+            return view2vector(self.polar_le_invar);
+        })
+        .def("polar_le_mlp_out",[](const Evaluator& self) {
+            // 模块⑦: RadialMLP 输出(N×1)。
+            return view2vector(self.polar_le_mlp_out);
+        })
+        .def("polar_local_electron_energy",[](const Evaluator& self) {
+            // 模块⑦: 逐原子 local_q_e(N,)（= mace 模块直出 squeeze(-1)）。
+            return view2vector(self.polar_le_atom);
+        })
+        .def("polar_le_energy",[](const Evaluator& self) {
+            // 模块⑦: le_total = 图内 Σ local_q_e（单图=整盒; 无缩放）。
+            return static_cast<double>(self.polar_le_total);
+        })
+        .def("polar_coulomb_energy",[](const Evaluator& self) {
+            // 模块⑥: 前向标量(1,), eV;口径 = SCF 末态密度 + 序列化
+            // include_self_interaction/include_pbc_corrections(本模型 True/True,
+            // TTT 修正恒 0)。polar 未启用时返回空列表。
+            return view2vector(self.polar_coulomb_energy);
+        })
+        .def("polar_coulomb_rho_re",[](const Evaluator& self) {
+            // 模块⑥ 诊断: ρ̂(k) 实部(Nk;未乘 (2π)³/V, 与预检脚本链口径见门脚本)。
+            return view2vector(self.polar_coulomb_rho_re);
+        })
+        .def("polar_coulomb_rho_im",[](const Evaluator& self) {
+            return view2vector(self.polar_coulomb_rho_im);
+        })
+        .def("polar_node_forces",[](const Evaluator& self) {
+            // 模块⑧: 节点级极性力(3N;−∂E/∂r;由 reduce 消费前的原始累加器)。
+            return view2vector(self.polar_node_forces);
+        })
+        .def("polar_reverse_terms_last",[](const Evaluator& self) {
+            // 模块⑧: 最近一次反向实际消费的种子掩码(bit0=⑦le,bit1=⑥coulomb;
+            // 诊断用,非 consume-once;0 ⇒ 引擎无极化能量项 ⇒ 力恒零)。
+            return self.polar_reverse_terms_last;
+        })
+        .def("polar_dbg_le_qin_bar",[](const Evaluator& self) {
+            // [dbg 2026-10-16] ⑧-7 le 反向 ∂E_le/∂q_in stage 探针(N×8)。
+            return view2vector(self.polar_dbg_le_qin_bar);
+        })
+        .def("polar_dbg_le_plast_bar",[](const Evaluator& self) {
+            // [dbg 2026-10-16] ⑧-7 le 反向 ∂E_le/∂P_last stage 探针(N×16)。
+            return view2vector(self.polar_dbg_le_plast_bar);
+        })
+        .def("polar_dbg_le_nf_bar",[](const Evaluator& self) {
+            // [dbg 2026-10-16] ⑧-7 le 反向 ∂E_le/∂nf_last stage 探针(N×2048)。
+            return view2vector(self.polar_dbg_le_nf_bar);
+        })
+        .def("polar_dbg_rev_dfinal",[](const Evaluator& self) {
+            // [dbg v24] 反向链 ∂E/∂d_final 检查点(N×8;POLAR_DBG_CKPT 置位时写入)。
+            return view2vector(self.polar_dbg_rev_dfinal);
+        })
+        .def("polar_dbg_rev_out_last",[](const Evaluator& self) {
+            // [dbg v24] 反向链 ∂E/∂out 末步检查点(N×10)。
+            return view2vector(self.polar_dbg_rev_out_last);
+        })
+        .def("polar_dbg_rev_out_first",[](const Evaluator& self) {
+            // [dbg v24] 反向链 ∂E/∂out 首步检查点(N×10)。
+            return view2vector(self.polar_dbg_rev_out_first);
+        })
+        .def("polar_dbg_rev_dpost",[](const Evaluator& self) {
+            // [dbg v24] 反向链 ∂E/∂d_post 末步迭代末检查点(N×8)。
+            return view2vector(self.polar_dbg_rev_dpost);
+        })
+        .def("polar_dbg_rev_dinit",[](const Evaluator& self) {
+            // [dbg v24] 反向链 ∂E/∂d_init 检查点(N×8)。
+            return view2vector(self.polar_dbg_rev_dinit);
+        })
+        .def("polar_dbg_rev_fmix",[](const Evaluator& self) {
+            // [dbg v24] 反向链 ∂E/∂features_mixed 检查点(N×F)。
+            return view2vector(self.polar_dbg_rev_fmix);
+        })
+        .def("polar_dbg_rev_pos_coul",[](const Evaluator& self) {
+            // [dbg v24] ⑥ 段后位置伴检查点(N×3)。
+            return view2vector(self.polar_dbg_rev_pos_coul);
+        })
+        .def("polar_dbg_rev_pos_all",[](const Evaluator& self) {
+            // [dbg v24] 全链位置伴终值检查点(N×3)。
+            return view2vector(self.polar_dbg_rev_pos_all);
+        })
+        .def("polar_blocks_enabled",[](const Evaluator& self) {
+            // 模块⑧: polar_enabled 只读镜像(pair style 用同名 C++ 访问器)。
+            return self.polar_blocks_enabled();
+        });
 }
 
 void bind_mace_nonlinear_kokkos(py::module_& module)

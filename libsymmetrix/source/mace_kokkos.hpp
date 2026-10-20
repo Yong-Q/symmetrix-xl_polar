@@ -98,6 +98,12 @@ const symmetrix::execution::ExecutionPlanReport& execution_plan_report() const;
 bool supports_streamed_edges() const;
 bool supports_fused_streamed_reverse() const;
 bool supports_factorized() const;
+// [P5 占位 2026-10-16] 极性(polar)路径契约。本类=线性引擎 ⇒ inert:
+// polar_blocks_enabled() 恒 false、polar_node_forces 恒空 ⇒ pair 侧 +13 行
+// (polar 节点力累加)零行为改变;P5 接线 = 让 MACE_Nonlinear/polar 模型分派到
+// 非线性引擎(其 polar_node_forces 类型与本占位一致:View<double*>, 3N)。
+bool polar_blocks_enabled() const { return false; }
+Kokkos::View<double*> polar_node_forces;   // (3N,) 占位(线性路径恒空)
 void load_jit_cuda_plugin(
     std::string path, int persistent_blocks_per_compute_unit = 8);
 bool jit_cuda_plugin_ready() const;

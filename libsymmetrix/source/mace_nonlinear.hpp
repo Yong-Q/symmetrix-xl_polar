@@ -103,6 +103,7 @@ private:
         E3Linear linear;
         std::unique_ptr<E3Linear> linear_1;
         std::unique_ptr<E3Linear> linear_2;
+        std::unique_ptr<E3Linear> linear_mid;  // NonLinearBiasReadoutBlock only
         double activation_constant;
         explicit Readout(const nlohmann::json& data);
         double evaluate(const std::vector<double>& features) const;

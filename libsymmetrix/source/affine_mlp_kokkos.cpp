@@ -2,6 +2,7 @@
 #include "affine_mlp.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -447,6 +448,50 @@ void AffineMLPKokkosT<Precision>::forward_impl(
             auto gamma=weights(layer);
             auto beta=biases(layer);
             const Precision epsilon=eps(layer);
+            const char* ln_env=std::getenv("MATOS_AFFINE_LN_PARALLEL");
+            const bool team_ln=!(ln_env!=nullptr&&std::atoi(ln_env)==0);
+            if(team_ln) {
+                // Round-3 slice 4: one team per row.  Mean/variance use a
+                // deterministic team tree reduction; the elementwise pass is
+                // one column per thread.  The default elementwise fallback
+                // (MATOS_AFFINE_LN_PARALLEL=0) preserves the round-2 kernel.
+                const int width=static_cast<int>(source.extent(1));
+                const int team_size=width<128?width:128;
+                Kokkos::parallel_for(
+                    "affine fused layer norm silu",
+                    Kokkos::TeamPolicy<>(target.extent(0),team_size),
+                    KOKKOS_LAMBDA(
+                        const Kokkos::TeamPolicy<>::member_type& team) {
+                        const int sample=team.league_rank();
+                        Precision mean=Precision(0);
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column,Precision& sum) {
+                                sum+=source(sample,column);
+                            },mean);
+                        mean/=width;
+                        Precision variance=Precision(0);
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column,Precision& sum) {
+                                const Precision delta=
+                                    source(sample,column)-mean;
+                                sum+=delta*delta;
+                            },variance);
+                        variance/=width;
+                        const Precision inverse=Precision(1)
+                            /Kokkos::sqrt(variance+epsilon);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column) {
+                                const Precision value=(source(sample,column)
+                                    -mean)*inverse*gamma(0,column)
+                                    +beta(column);
+                                target(sample,column)=value
+                                    /(Precision(1)+Kokkos::exp(-value));
+                            });
+                    });
+            } else {
             Kokkos::parallel_for(
                 "affine fused layer norm silu",target.extent(0),
                 KOKKOS_LAMBDA(int sample) {
@@ -467,6 +512,7 @@ void AffineMLPKokkosT<Precision>::forward_impl(
                         target(sample,column)=value/(Precision(1)+Kokkos::exp(-value));
                     }
                 });
+            }
             layer+=2;
             continue;
         }
@@ -727,6 +773,89 @@ void AffineMLPKokkosT<Precision>::reverse_from_tape_impl(
             auto gamma=weights(layer-1);
             auto beta=biases(layer-1);
             const Precision epsilon=eps(layer-1);
+            const char* ln_env=std::getenv("MATOS_AFFINE_LN_PARALLEL");
+            const bool team_ln=!(ln_env!=nullptr&&std::atoi(ln_env)==0)
+                &&source.extent(1)<=512;
+            if(team_ln) {
+                // Round-3 slice 4 (reverse): one team per row, deterministic
+                // tree reductions for mean/variance and for the two LN
+                // backward sums.  The normalized value and SiLU derivative
+                // are staged in team scratch so exp() is evaluated once per
+                // element instead of twice.
+                const int width=static_cast<int>(source.extent(1));
+                const int team_size=width<128?width:128;
+                using scratch_view=Kokkos::View<Precision*,
+                    Kokkos::DefaultExecutionSpace::scratch_memory_space,
+                    Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+                const std::size_t smem=
+                    scratch_view::shmem_size(2*width);
+                Kokkos::parallel_for(
+                    "affine fused reverse layer norm silu",
+                    Kokkos::TeamPolicy<>(source.extent(0),team_size)
+                        .set_scratch_size(0,Kokkos::PerTeam(smem)),
+                    KOKKOS_LAMBDA(
+                        const Kokkos::TeamPolicy<>::member_type& team) {
+                        const int sample=team.league_rank();
+                        Precision mean=Precision(0);
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column,Precision& acc) {
+                                acc+=source(sample,column);
+                            },mean);
+                        mean/=width;
+                        Precision variance=Precision(0);
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column,Precision& acc) {
+                                const Precision delta=
+                                    source(sample,column)-mean;
+                                acc+=delta*delta;
+                            },variance);
+                        variance/=width;
+                        const Precision inverse=Precision(1)
+                            /Kokkos::sqrt(variance+epsilon);
+                        scratch_view scratch(team.team_scratch(0),
+                            2*width);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column) {
+                                const Precision normalized=
+                                    (source(sample,column)-mean)*inverse;
+                                const Precision value=normalized
+                                    *gamma(0,column)+beta(column);
+                                const Precision probability=Precision(1)
+                                    /(Precision(1)+Kokkos::exp(-value));
+                                const Precision scaled=
+                                    target_adj(sample,column)
+                                    *(probability+value*probability
+                                        *(Precision(1)-probability))
+                                    *gamma(0,column);
+                                scratch(column)=normalized;
+                                scratch(width+column)=scaled;
+                            });
+                        Precision sum=Precision(0);
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column,Precision& acc) {
+                                acc+=scratch(width+column);
+                            },sum);
+                        Precision sum_normalized=Precision(0);
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column,Precision& acc) {
+                                acc+=scratch(width+column)
+                                    *scratch(column);
+                            },sum_normalized);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team,width),
+                            [&](const int column) {
+                                source_adj(sample,column)=inverse
+                                    *(width*scratch(width+column)-sum
+                                        -scratch(column)*sum_normalized)
+                                    /width;
+                            });
+                    });
+            } else {
             Kokkos::parallel_for(
                 "affine fused reverse layer norm silu",source.extent(0),
                 KOKKOS_LAMBDA(int sample) {
@@ -765,6 +894,7 @@ void AffineMLPKokkosT<Precision>::reverse_from_tape_impl(
                             *(width*scaled-sum-normalized*sum_normalized)/width;
                     }
                 });
+            }
             layer-=2;
             continue;
         }

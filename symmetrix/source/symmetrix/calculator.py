@@ -1600,6 +1600,16 @@ class Symmetrix(Calculator):
         if self.kernel_launch_policy == "static":
             self.kernel_launch_tuning_status = "static"
             return False
+        # Resolve the implementation identity first: materialized/non-JIT
+        # models have no tunable launch implementation, and querying the
+        # device environment can be expensive (driver/device enumeration).
+        implementation_identity = self._kernel_launch_implementation_identity()
+        if not implementation_identity:
+            self.kernel_launch_tuning_status = "ineligible"
+            self.kernel_launch_tuning_reason = (
+                "no tunable launch implementation is active"
+            )
+            return False
         environment = getattr(
             self.evaluator, "execution_device_execution_environment", None
         )
@@ -1613,13 +1623,6 @@ class Symmetrix(Calculator):
             self.kernel_launch_tuning_reason = (
                 f"Execution launch tuning does not support backend {backend!r}; "
                 "CUDA or HIP is required"
-            )
-            return False
-        implementation_identity = self._kernel_launch_implementation_identity()
-        if not implementation_identity:
-            self.kernel_launch_tuning_status = "ineligible"
-            self.kernel_launch_tuning_reason = (
-                "no tunable launch implementation is active"
             )
             return False
         from .kernel_launch_tuning import (
@@ -3391,6 +3394,26 @@ class Symmetrix(Calculator):
             )
         xyz_flat = np.ascontiguousarray(xyz, dtype=float).reshape(-1)
         distances = np.ascontiguousarray(r, dtype=float)
+        # PolarMACE 的分子总电荷/自旋(mace info 口径: atoms.info["charge"]/
+        # ["spin"],total_spin 为 2S+1 多重度,默认 0/1;仅 polar 模型消费,
+        # 其余模型参数默认值无影响)。
+        total_charge = 0.0
+        total_spin = 1.0
+        node_positions = None
+        cell_array = None
+        if atoms is not None:
+            info = getattr(atoms, "info", {})
+            total_charge = float(info.get("charge", 0.0))
+            total_spin = float(info.get("spin", 1.0))
+            # PolarMACE 静电层需要节点坐标与晶胞(结构因子/倒格矢);
+            # 非 polar 模型忽略这两个可选参数。
+            node_positions = np.ascontiguousarray(
+                atoms.get_positions(), dtype=float).reshape(-1)
+            try:
+                cell_array = np.ascontiguousarray(
+                    np.asarray(atoms.cell, dtype=float)).reshape(-1)
+            except (TypeError, ValueError):
+                cell_array = None
         self.evaluator.compute_node_energies_forces(
             num_nodes,
             node_types,
@@ -3399,6 +3422,10 @@ class Symmetrix(Calculator):
             neigh_types,
             xyz_flat,
             distances,
+            total_charge=total_charge,
+            total_spin=total_spin,
+            node_positions=node_positions,
+            cell=cell_array,
         )
         return 0
 

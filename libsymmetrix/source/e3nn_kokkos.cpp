@@ -1,11 +1,17 @@
 #include "e3nn_kokkos.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 #include "KokkosBlas.hpp"
@@ -18,6 +24,13 @@ constexpr int linear_host_transpose_channel_tile=16;
 // transpose resident together for the wide MH-1 node features.
 constexpr int linear_host_transpose_sample_tile=4;
 constexpr int linear_host_angular_output_sample_tile=8;
+// Scalar e3 linear kernels on the GPU: one thread owns one (target,component)
+// for a small block of consecutive samples.  The per-output accumulation over
+// `source` stays serial and ascending, so results are bitwise unchanged; the
+// block only amortizes the weight-column loads and provides independent
+// accumulator chains.  Lanes are laid out component->target->sample-group so
+// that weights and outputs are coalesced while the input row is broadcast.
+constexpr int e3_linear_sample_block=8;
 
 template<typename Precision>
 std::vector<Precision> tensor_values(const nlohmann::json& value) { return value.at("values").get<std::vector<Precision>>(); }
@@ -64,6 +77,8 @@ E3LinearKokkosT<Precision>::E3LinearKokkosT(const nlohmann::json& data)
         runtime_output_blocks.push_back(
             {block.offset,block.multiplicity,2*block.l+1});
     for (const auto& value:data.at("instructions")) {
+        // e3nn bias-only instruction (i_in == -1): no weight; bias handled via the bias field.
+        if(value.at("i_in").get<int>()==-1)continue;
         const auto& in=input.blocks.at(value.at("i_in").get<int>()); const auto& out=output.blocks.at(value.at("i_out").get<int>());
         const auto shape=value.at("path_shape").get<std::vector<int>>();
         instructions.push_back({in.offset,out.offset,in.multiplicity,
@@ -122,6 +137,37 @@ E3LinearKokkosT<Precision>::E3LinearKokkosT(const nlohmann::json& data)
             [&](const auto& other) {
                 return other.output_offset==instruction.output_offset;
             });
+    }
+    {
+        // The merged-unpack path is only safe when each output element has
+        // exactly one writer.  Multiple instructions can target the same
+        // output block (the e3 linear block-sparse sum), in which case the
+        // unpack kernels must stay interleaved.
+        std::vector<std::pair<int,int>> intervals;
+        intervals.reserve(instructions.size());
+        for(const auto& instruction:instructions)
+            intervals.emplace_back(instruction.output_offset,
+                instruction.output_offset
+                    +instruction.output_multiplicity*instruction.width);
+        std::sort(intervals.begin(),intervals.end());
+        output_blocks_disjoint_=true;
+        for(std::size_t index=1;index<intervals.size();++index)
+            if(intervals[index].first<intervals[index-1].second) {
+                output_blocks_disjoint_=false;
+                break;
+            }
+        intervals.clear();
+        for(const auto& instruction:instructions)
+            intervals.emplace_back(instruction.input_offset,
+                instruction.input_offset
+                    +instruction.input_multiplicity*instruction.width);
+        std::sort(intervals.begin(),intervals.end());
+        input_blocks_disjoint_=true;
+        for(std::size_t index=1;index<intervals.size();++index)
+            if(intervals[index].first<intervals[index-1].second) {
+                input_blocks_disjoint_=false;
+                break;
+            }
     }
     all_output_blocks_covered_=std::all_of(
         runtime_output_blocks.begin(),runtime_output_blocks.end(),
@@ -357,6 +403,8 @@ void E3LinearKokkosT<Precision>::replace_block_with_identity(const int width)
                 source==target?diagonal:Precision(0);
     Kokkos::deep_copy(weights,host_weights);
     instruction->identity=true;
+    merged_fwd_samples_=-1;
+    merged_rev_samples_=-1;
 }
 
 template<typename Precision>
@@ -383,7 +431,15 @@ bool E3LinearKokkosT<Precision>::use_scalar_backend(std::size_t samples) const
     if(backend_==Backend::scalar) return true;
     if(backend_==Backend::packed_gemm) return false;
 #ifdef KOKKOS_ENABLE_CUDA
-    return true;
+    // Packed FP64 GEMM is substantially faster than the scalar path on CUDA
+    // (measured 2026-10-19 on the 128-atom NH3 model).  It changes the FP64
+    // summation order, not the math.  MATOS_E3_LINEAR_CUDA_BACKEND=scalar
+    // selects the bitwise per-output scalar kernels instead.
+    if(const char* requested=std::getenv("MATOS_E3_LINEAR_CUDA_BACKEND")) {
+        if(std::strcmp(requested,"scalar")==0) return true;
+        if(std::strcmp(requested,"packed_gemm")==0) return false;
+    }
+    return false;
 #else
     return samples<=4;
 #endif
@@ -415,23 +471,64 @@ void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos:
     const bool use_scalar_path=use_scalar_backend(input.extent(0));
     if(use_scalar_path) {
         ordered_kokkos_deep_copy(output,Precision(0));
-        for(const auto instruction:instructions)
+        const int samples=static_cast<int>(input.extent(0));
+        for(const auto instruction:instructions) {
+            const int input_multiplicity=instruction.input_multiplicity;
+            const int output_multiplicity=instruction.output_multiplicity;
+            const int width=instruction.width;
+            const int input_offset=instruction.input_offset;
+            const int output_offset=instruction.output_offset;
+            const int weight_offset=instruction.weight_offset;
+            const Precision path_weight=instruction.path_weight;
+            const int sample_groups=
+                (samples+e3_linear_sample_block-1)/e3_linear_sample_block;
             Kokkos::parallel_for(
                 "e3 linear small batch",
-                Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
-                    {0,0,0},{static_cast<int>(input.extent(0)),
-                        instruction.output_multiplicity,instruction.width}),
-                KOKKOS_LAMBDA(int sample,int target,int component) {
-                    Precision value=Precision(0);
-                    for(int source=0;source<instruction.input_multiplicity;++source)
-                        value+=instruction.path_weight
-                            *all_weights(instruction.weight_offset
-                                +source*instruction.output_multiplicity+target)
-                            *input(sample,instruction.input_offset
-                                +source*instruction.width+component);
-                    output(sample,instruction.output_offset
-                        +target*instruction.width+component)+=value;
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                    0,sample_groups*output_multiplicity*width),
+                KOKKOS_LAMBDA(const int flat) {
+                    const int component=flat%width;
+                    const int outer=flat/width;
+                    const int target=outer%output_multiplicity;
+                    const int sample_base=(outer/output_multiplicity)
+                        *e3_linear_sample_block;
+                    const int output_index=output_offset
+                        +target*width+component;
+                    Precision values[e3_linear_sample_block];
+                    #pragma unroll
+                    for(int slot=0;slot<e3_linear_sample_block;++slot)
+                        values[slot]=Precision(0);
+                    if(sample_base+e3_linear_sample_block<=samples) {
+                        for(int source=0;source<input_multiplicity;++source) {
+                            const Precision weight=all_weights(
+                                weight_offset
+                                +source*output_multiplicity+target);
+                            const int input_index=input_offset
+                                +source*width+component;
+                            #pragma unroll
+                            for(int slot=0;slot<e3_linear_sample_block;++slot)
+                                values[slot]+=path_weight*weight
+                                    *input(sample_base+slot,input_index);
+                        }
+                    } else {
+                        for(int source=0;source<input_multiplicity;++source) {
+                            const Precision weight=all_weights(
+                                weight_offset
+                                +source*output_multiplicity+target);
+                            const int input_index=input_offset
+                                +source*width+component;
+                            for(int slot=0;slot<e3_linear_sample_block;++slot)
+                                if(sample_base+slot<samples)
+                                    values[slot]+=path_weight*weight
+                                        *input(sample_base+slot,input_index);
+                        }
+                    }
+                    #pragma unroll
+                    for(int slot=0;slot<e3_linear_sample_block;++slot)
+                        if(sample_base+slot<samples)
+                            output(sample_base+slot,output_index)+=values[slot];
                 });
+        }
         auto mask=output_mask; auto all_bias=bias;
         Kokkos::parallel_for("e3 linear mask",output.size(),KOKKOS_LAMBDA(std::size_t flat) {
             const std::size_t sample=flat/output.extent(1);
@@ -445,7 +542,130 @@ void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos:
         ordered_kokkos_deep_copy(output,Precision(0));
     const bool fuse_output_finalization=all_output_blocks_covered_
         ||uncovered_output_finalization_is_zero_;
-    for (const auto& instruction:instructions) {
+    // Round-3 merged unpack: every GEMM writes into its own ragged block in
+    // one flat buffer.  The unpack plan is keyed by *output block*: each
+    // output element sums its contributing instruction blocks in instruction
+    // order, then applies the first/last finalization once.  This is correct
+    // for the block-sparse e3 linear sum, where several instructions can
+    // target the same output block; a single kernel replaces all per-
+    // instruction unpack launches.
+    const char* merged_unpack_env=std::getenv(
+        "MATOS_E3_LINEAR_MERGED_UNPACK");
+    const char* merged_only_env=std::getenv(
+        "MATOS_E3_LINEAR_MERGED_ONLY");
+    const int merged_only=merged_only_env?std::atoi(merged_only_env):-1;
+    // Experimental and currently unsafe (illegal memory access in the
+    // multi-contribution blocking); opt-in until the indexing bug is fixed.
+    const bool merged_unpack=merged_unpack_env!=nullptr
+        &&std::atoi(merged_unpack_env)!=0
+        &&(merged_only<0||output_dimension_==merged_only)
+        &&reinterpret_cast<const void*>(input.data())
+            !=reinterpret_cast<const void*>(output.data())
+        &&std::none_of(instructions.begin(),instructions.end(),
+            [](const auto& value) { return value.identity; });
+    // The plan stores each output block's contributions as a contiguous range.
+    // Instructions are ordered by weight offset, so writers of the same block
+    // can be interleaved (e.g. widths 1,3,1,3).  A stable sort by
+    // output_offset makes each block's writers contiguous while preserving
+    // their per-block accumulation order.
+    std::vector<Instruction> merged_instructions;
+    const std::vector<Instruction>* active_instructions=&instructions;
+    if(merged_unpack) {
+        merged_instructions=instructions;
+        std::stable_sort(merged_instructions.begin(),
+            merged_instructions.end(),[](const Instruction& left,
+                const Instruction& right) {
+                return left.output_offset<right.output_offset;
+            });
+        active_instructions=&merged_instructions;
+    }
+    int merged_block_count=0,max_output_elements=0;
+    std::size_t merged_total_elements=0,merged_offset=0;
+    const int merged_samples=static_cast<int>(input.extent(0));
+    const bool merged_plan_cached=merged_unpack
+        &&merged_fwd_samples_==merged_samples
+        &&merged_fwd_blocks_>0;
+    if(merged_unpack&&!merged_plan_cached) {
+        struct BlockPlan {
+            int output_offset,output_multiplicity,width,columns,
+                first_contribution,contribution_count;
+        };
+        std::vector<BlockPlan> blocks;
+        std::vector<int> contributions;
+        std::unordered_map<int,int> block_index;
+        for(const auto& instruction:*active_instructions) {
+            if(instruction.identity) continue;
+            const int columns=static_cast<int>(input.extent(0))
+                *instruction.width;
+            auto found=block_index.find(instruction.output_offset);
+            if(found==block_index.end()) {
+                const int index=static_cast<int>(blocks.size());
+                block_index.emplace(instruction.output_offset,index);
+                blocks.push_back({instruction.output_offset,
+                    instruction.output_multiplicity,instruction.width,
+                    columns,static_cast<int>(contributions.size()),0});
+                found=block_index.find(instruction.output_offset);
+            }
+            auto& block=blocks[found->second];
+            contributions.push_back(static_cast<int>(merged_offset));
+            ++block.contribution_count;
+            merged_offset+=static_cast<std::size_t>(
+                instruction.output_multiplicity)*columns;
+        }
+        merged_block_count=static_cast<int>(blocks.size());
+        merged_total_elements=merged_offset;
+        for(const auto& block:blocks)
+            max_output_elements=std::max(max_output_elements,
+                block.output_multiplicity*block.columns);
+        if(workspace_->packed_output_flat.extent(0)
+                <merged_total_elements)
+            Kokkos::realloc(Kokkos::WithoutInitializing,
+                workspace_->packed_output_flat,merged_total_elements);
+        if(merged_plan_.extent(0)
+                <static_cast<std::size_t>(merged_block_count)
+            ||merged_plan_.extent(1)<6)
+            Kokkos::realloc(Kokkos::WithoutInitializing,
+                merged_plan_,merged_block_count,6);
+        if(merged_contrib_.extent(0)
+                <contributions.size())
+            Kokkos::realloc(Kokkos::WithoutInitializing,
+                merged_contrib_,
+                contributions.size());
+        auto plan=merged_plan_;
+        auto plan_host=Kokkos::create_mirror_view(plan);
+        for(int row=0;row<merged_block_count;++row) {
+            plan_host(row,0)=blocks[row].output_offset;
+            plan_host(row,1)=blocks[row].output_multiplicity;
+            plan_host(row,2)=blocks[row].width;
+            plan_host(row,3)=blocks[row].columns;
+            plan_host(row,4)=blocks[row].first_contribution;
+            plan_host(row,5)=blocks[row].contribution_count;
+        }
+        Kokkos::deep_copy(plan,plan_host);
+        auto contrib=merged_contrib_;
+        auto contrib_host=Kokkos::create_mirror_view(contrib);
+        for(std::size_t i=0;i<contributions.size();++i)
+            contrib_host(i)=contributions[i];
+        Kokkos::deep_copy(contrib,contrib_host);
+        merged_fwd_samples_=merged_samples;
+        merged_fwd_blocks_=merged_block_count;
+        merged_fwd_max_elements_=max_output_elements;
+        merged_fwd_total_elements_=
+            merged_total_elements;
+        // Forward and reverse use the same per-layer plan views; the reverse
+        // cache must be rebuilt after this forward plan overwrites them.
+        merged_rev_samples_=-1;
+    }
+    if(merged_plan_cached) {
+        merged_block_count=merged_fwd_blocks_;
+        max_output_elements=merged_fwd_max_elements_;
+        merged_total_elements=merged_fwd_total_elements_;
+    }
+    // The plan-construction pass above advanced merged_offset to the end of
+    // the flat buffer.  Rewind it before the GEMM pass so the per-instruction
+    // blocks are written at the same offsets recorded in unpack_contrib_offsets.
+    merged_offset=0;
+    for (const auto& instruction:*active_instructions) {
         const int samples=input.extent(0);
         if(instruction.identity) {
             auto mask=output_mask;
@@ -574,6 +794,19 @@ void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos:
         weight_matrix weight(
             all_weights.data()+instruction.weight_offset,
             instruction.input_multiplicity,instruction.output_multiplicity);
+        if(merged_unpack) {
+            using merged_matrix=Kokkos::View<
+                Precision**,Kokkos::LayoutRight,
+                Kokkos::MemoryUnmanaged>;
+            merged_matrix merged_output(
+                workspace_->packed_output_flat.data()+merged_offset,
+                instruction.output_multiplicity,columns);
+            KokkosBlas::gemm("T","N",instruction.path_weight,weight,
+                packed_input,Precision(0),merged_output);
+            merged_offset+=static_cast<std::size_t>(
+                instruction.output_multiplicity)*columns;
+            continue;
+        }
         KokkosBlas::gemm("T","N",instruction.path_weight,weight,packed_input,
             Precision(0),packed_output);
         auto mask=output_mask;
@@ -644,6 +877,110 @@ void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos:
                     output(sample,output_index)=value;
                 });
     }
+    if(merged_unpack&&merged_block_count>0
+        &&max_output_elements>0) {
+        // Debug: dump the flat GEMM blocks and the plan for the first few
+        // 2048-wide merged layers so the host can recompute the expected sum.
+        if(const char* dump_dir=
+                std::getenv("MATOS_E3_LINEAR_MERGED_FLAT_DUMP")) {
+            static std::atomic<int> flat_dump_sequence{0};
+            if(output_dimension_==2048) {
+                const int sequence=flat_dump_sequence.fetch_add(1);
+                if(sequence<40) {
+                Kokkos::View<Precision*,Kokkos::LayoutRight,
+                    Kokkos::HostSpace> flat_host("flat dump",
+                        workspace_->packed_output_flat.extent(0));
+                Kokkos::deep_copy(flat_host,
+                    workspace_->packed_output_flat);
+                Kokkos::View<int**,Kokkos::LayoutRight,
+                    Kokkos::HostSpace> plan_host("plan dump",
+                        merged_plan_.extent(0),
+                        merged_plan_.extent(1));
+                Kokkos::deep_copy(plan_host,merged_plan_);
+                Kokkos::View<int*,Kokkos::LayoutRight,
+                    Kokkos::HostSpace> contrib_host("contrib dump",
+                        merged_contrib_.extent(0));
+                Kokkos::deep_copy(contrib_host,
+                    merged_contrib_);
+                char path[512];
+                std::snprintf(path,sizeof(path),"%s/flat_%03d_%d.bin",
+                    dump_dir,sequence,output_dimension_);
+                std::ofstream stream(path,std::ios::binary);
+                if(stream) {
+                    const int header[5]={sequence,output_dimension_,
+                        merged_block_count,
+                        static_cast<int>(merged_total_elements),
+                        static_cast<int>(input.extent(0))};
+                    stream.write(reinterpret_cast<const char*>(header),
+                        sizeof(header));
+                    stream.write(reinterpret_cast<const char*>(
+                            flat_host.data()),
+                        static_cast<std::streamsize>(
+                            flat_host.size()*sizeof(Precision)));
+                }
+                std::snprintf(path,sizeof(path),"%s/plan_%03d_%d.bin",
+                    dump_dir,sequence,output_dimension_);
+                std::ofstream plan_stream(path,std::ios::binary);
+                if(plan_stream) {
+                    const int header[2]={merged_block_count,
+                        static_cast<int>(plan_host.extent(1))};
+                    plan_stream.write(reinterpret_cast<const char*>(header),
+                        sizeof(header));
+                    plan_stream.write(reinterpret_cast<const char*>(
+                            plan_host.data()),
+                        static_cast<std::streamsize>(
+                            plan_host.size()*sizeof(int)));
+                }
+                std::snprintf(path,sizeof(path),"%s/contrib_%03d_%d.bin",
+                    dump_dir,sequence,output_dimension_);
+                std::ofstream contrib_stream(path,std::ios::binary);
+                if(contrib_stream)
+                    contrib_stream.write(reinterpret_cast<const char*>(
+                            contrib_host.data()),
+                        static_cast<std::streamsize>(
+                            contrib_host.size()*sizeof(int)));
+                }
+            }
+        }
+        auto plan=merged_plan_;
+        auto contributions=merged_contrib_;
+        auto flat=workspace_->packed_output_flat;
+        auto mask=output_mask;
+        auto all_bias=bias;
+        const bool fuse_finalization=fuse_output_finalization;
+        Kokkos::parallel_for("e3 linear unpack merged",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                {0,0},{merged_block_count,max_output_elements}),
+            KOKKOS_LAMBDA(int row,int idx) {
+                const int output_offset=plan(row,0);
+                const int output_multiplicity=plan(row,1);
+                const int width=plan(row,2);
+                const int columns=plan(row,3);
+                const int first_contribution=plan(row,4);
+                const int contribution_count=plan(row,5);
+                if(idx>=output_multiplicity*columns) return;
+                const int channel=idx/columns;
+                const int column=idx%columns;
+                const int component=column%width;
+                const int sample=column/width;
+                const int output_index=output_offset
+                    +channel*width+component;
+                Precision value=Precision(0);
+                for(int c=0;c<contribution_count;++c) {
+                    const int offset=contributions(first_contribution+c);
+                    if(static_cast<std::size_t>(offset+idx)
+                        <flat.extent(0))
+                        value+=flat(offset+idx);
+                }
+                if(!fuse_finalization)
+                    value+=output(sample,output_index);
+                else
+                    value=(value+(all_bias.size()
+                        ?all_bias(output_index):Precision(0)))
+                        *mask(output_index);
+                output(sample,output_index)=value;
+            });
+    }
     if(!fuse_output_finalization) {
         auto mask=output_mask;
         auto all_bias=bias;
@@ -655,6 +992,30 @@ void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos:
                     +(all_bias.size()?all_bias(column):Precision(0)))
                     *mask(column);
             });
+    }
+    // Debug: dump every linear output so merged and non-merged runs can be
+    // compared call-by-call.  Only active when MATOS_E3_LINEAR_DUMP is set.
+    if(const char* dump_dir=std::getenv("MATOS_E3_LINEAR_DUMP")) {
+        static std::atomic<int> dump_sequence{0};
+        const int sequence=dump_sequence.fetch_add(1);
+        Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::HostSpace>
+            dump("e3 linear dump",output.extent(0),output.extent(1));
+        Kokkos::deep_copy(dump,output);
+        char path[512];
+        std::snprintf(path,sizeof(path),"%s/e3_%04d_%dx%d.bin",dump_dir,
+            sequence,static_cast<int>(output.extent(0)),
+            static_cast<int>(output.extent(1)));
+        std::ofstream stream(path,std::ios::binary);
+        if(stream) {
+            const int header[3]={sequence,
+                static_cast<int>(output.extent(0)),
+                static_cast<int>(output.extent(1))};
+            stream.write(reinterpret_cast<const char*>(header),
+                sizeof(header));
+            stream.write(reinterpret_cast<const char*>(dump.data()),
+                static_cast<std::streamsize>(
+                    dump.size()*sizeof(Precision)));
+        }
     }
 }
 
@@ -1209,28 +1570,183 @@ void E3LinearKokkosT<Precision>::reverse(
     auto all_weights=weights; auto mask=output_mask;
     const bool use_scalar_path=use_scalar_backend(output_adjoint.extent(0));
     if(use_scalar_path) {
-        for(const auto instruction:instructions)
+        const int samples=static_cast<int>(output_adjoint.extent(0));
+        for(const auto instruction:instructions) {
+            const int input_multiplicity=instruction.input_multiplicity;
+            const int output_multiplicity=instruction.output_multiplicity;
+            const int width=instruction.width;
+            const int input_offset=instruction.input_offset;
+            const int output_offset=instruction.output_offset;
+            const int weight_offset=instruction.weight_offset;
+            const Precision path_weight=instruction.path_weight;
+            const int sample_groups=
+                (samples+e3_linear_sample_block-1)/e3_linear_sample_block;
             Kokkos::parallel_for(
                 "e3 reverse linear small batch",
-                Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
-                    {0,0,0},{static_cast<int>(output_adjoint.extent(0)),
-                        instruction.input_multiplicity,instruction.width}),
-                KOKKOS_LAMBDA(int sample,int source,int component) {
-                    Precision value=Precision(0);
-                    for(int target=0;target<instruction.output_multiplicity;++target) {
-                        const int output_index=instruction.output_offset
-                            +target*instruction.width+component;
-                        value+=instruction.path_weight
-                            *all_weights(instruction.weight_offset
-                                +source*instruction.output_multiplicity+target)
-                            *mask(output_index)*output_adjoint(sample,output_index);
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                    0,sample_groups*input_multiplicity*width),
+                KOKKOS_LAMBDA(const int flat) {
+                    const int component=flat%width;
+                    const int outer=flat/width;
+                    const int source=outer%input_multiplicity;
+                    const int sample_base=(outer/input_multiplicity)
+                        *e3_linear_sample_block;
+                    const int input_index=input_offset
+                        +source*width+component;
+                    Precision values[e3_linear_sample_block];
+                    #pragma unroll
+                    for(int slot=0;slot<e3_linear_sample_block;++slot)
+                        values[slot]=Precision(0);
+                    if(sample_base+e3_linear_sample_block<=samples) {
+                        for(int target=0;target<output_multiplicity;++target) {
+                            const int output_index=output_offset
+                                +target*width+component;
+                            const Precision scaled=path_weight
+                                *all_weights(weight_offset
+                                    +source*output_multiplicity+target)
+                                *mask(output_index);
+                            #pragma unroll
+                            for(int slot=0;slot<e3_linear_sample_block;++slot)
+                                values[slot]+=scaled
+                                    *output_adjoint(sample_base+slot,
+                                        output_index);
+                        }
+                    } else {
+                        for(int target=0;target<output_multiplicity;++target) {
+                            const int output_index=output_offset
+                                +target*width+component;
+                            const Precision scaled=path_weight
+                                *all_weights(weight_offset
+                                    +source*output_multiplicity+target)
+                                *mask(output_index);
+                            for(int slot=0;slot<e3_linear_sample_block;++slot)
+                                if(sample_base+slot<samples)
+                                    values[slot]+=scaled
+                                        *output_adjoint(sample_base+slot,
+                                            output_index);
+                        }
                     }
-                    input_adjoint(sample,instruction.input_offset
-                        +source*instruction.width+component)+=value;
+                    #pragma unroll
+                    for(int slot=0;slot<e3_linear_sample_block;++slot)
+                        if(sample_base+slot<samples)
+                            input_adjoint(sample_base+slot,input_index)
+                                +=values[slot];
                 });
+        }
         return;
     }
-    for (const auto& instruction:instructions) {
+    // Round-3 merged reverse unpack: each GEMM writes its packed input
+    // adjoint into a ragged block of one flat buffer; a single unpack kernel
+    // afterwards scatters all blocks into input_adjoint.
+    const char* merged_unpack_env=std::getenv(
+        "MATOS_E3_LINEAR_MERGED_UNPACK");
+    const char* merged_only_env=std::getenv(
+        "MATOS_E3_LINEAR_MERGED_ONLY");
+    const int merged_only=merged_only_env?std::atoi(merged_only_env):-1;
+    // Experimental and currently unsafe (illegal memory access in the
+    // multi-contribution blocking); opt-in until the indexing bug is fixed.
+    const bool merged_unpack=merged_unpack_env!=nullptr
+        &&std::atoi(merged_unpack_env)!=0
+        &&(merged_only<0||output_dimension_==merged_only)
+        &&reinterpret_cast<const void*>(output_adjoint.data())
+            !=reinterpret_cast<const void*>(input_adjoint.data())
+        &&std::none_of(instructions.begin(),instructions.end(),
+            [](const auto& value) { return value.identity; });
+    // Reverse: group contributions by input_offset.  A stable sort keeps each
+    // input block's writers contiguous while preserving their order.
+    std::vector<Instruction> merged_instructions;
+    const std::vector<Instruction>* active_instructions=&instructions;
+    if(merged_unpack) {
+        merged_instructions=instructions;
+        std::stable_sort(merged_instructions.begin(),
+            merged_instructions.end(),[](const Instruction& left,
+                const Instruction& right) {
+                return left.input_offset<right.input_offset;
+            });
+        active_instructions=&merged_instructions;
+    }
+    const int merged_samples=static_cast<int>(output_adjoint.extent(0));
+    int merged_block_count=0,max_merged_elements=0;
+    std::size_t merged_total_elements=0,merged_offset=0;
+    const bool merged_plan_cached=merged_unpack
+        &&merged_rev_samples_==merged_samples
+        &&merged_rev_blocks_>0;
+    if(merged_unpack&&!merged_plan_cached) {
+        struct BlockPlan {
+            int input_offset,input_multiplicity,width,columns,
+                first_contribution,contribution_count;
+        };
+        std::vector<BlockPlan> blocks;
+        std::vector<int> contributions;
+        std::unordered_map<int,int> block_index;
+        for(const auto& instruction:*active_instructions) {
+            if(instruction.identity) continue;
+            const int columns=merged_samples*instruction.width;
+            auto found=block_index.find(instruction.input_offset);
+            if(found==block_index.end()) {
+                const int index=static_cast<int>(blocks.size());
+                block_index.emplace(instruction.input_offset,index);
+                blocks.push_back({instruction.input_offset,
+                    instruction.input_multiplicity,instruction.width,
+                    columns,static_cast<int>(contributions.size()),0});
+                found=block_index.find(instruction.input_offset);
+            }
+            auto& block=blocks[found->second];
+            contributions.push_back(static_cast<int>(merged_offset));
+            ++block.contribution_count;
+            merged_offset+=static_cast<std::size_t>(
+                instruction.input_multiplicity)*columns;
+        }
+        merged_block_count=static_cast<int>(blocks.size());
+        merged_total_elements=merged_offset;
+        for(const auto& block:blocks)
+            max_merged_elements=std::max(max_merged_elements,
+                block.input_multiplicity*block.columns);
+        if(workspace_->packed_output_flat.extent(0)
+                <merged_total_elements)
+            Kokkos::realloc(Kokkos::WithoutInitializing,
+                workspace_->packed_output_flat,merged_total_elements);
+        if(merged_plan_.extent(0)
+                <static_cast<std::size_t>(merged_block_count)
+            ||merged_plan_.extent(1)<6)
+            Kokkos::realloc(Kokkos::WithoutInitializing,
+                merged_plan_,merged_block_count,6);
+        if(merged_contrib_.extent(0)
+                <contributions.size())
+            Kokkos::realloc(Kokkos::WithoutInitializing,
+                merged_contrib_,
+                contributions.size());
+        auto plan=merged_plan_;
+        auto plan_host=Kokkos::create_mirror_view(plan);
+        for(int row=0;row<merged_block_count;++row) {
+            plan_host(row,0)=blocks[row].input_offset;
+            plan_host(row,1)=blocks[row].input_multiplicity;
+            plan_host(row,2)=blocks[row].width;
+            plan_host(row,3)=blocks[row].columns;
+            plan_host(row,4)=blocks[row].first_contribution;
+            plan_host(row,5)=blocks[row].contribution_count;
+        }
+        Kokkos::deep_copy(plan,plan_host);
+        auto contrib=merged_contrib_;
+        auto contrib_host=Kokkos::create_mirror_view(contrib);
+        for(std::size_t i=0;i<contributions.size();++i)
+            contrib_host(i)=contributions[i];
+        Kokkos::deep_copy(contrib,contrib_host);
+        merged_rev_samples_=merged_samples;
+        merged_rev_blocks_=merged_block_count;
+        merged_rev_max_elements_=max_merged_elements;
+        merged_rev_total_elements_=merged_total_elements;
+        // The reverse plan now owns the per-layer plan views.
+        merged_fwd_samples_=-1;
+    }
+    if(merged_plan_cached) {
+        merged_block_count=merged_rev_blocks_;
+        max_merged_elements=merged_rev_max_elements_;
+        merged_total_elements=merged_rev_total_elements_;
+    }
+    // Rewind the flat-buffer cursor consumed by the plan pass (see forward).
+    merged_offset=0;
+    for (const auto& instruction:*active_instructions) {
         const int samples=output_adjoint.extent(0);
         if(instruction.identity) {
             if constexpr(std::is_same_v<
@@ -1344,6 +1860,20 @@ void E3LinearKokkosT<Precision>::reverse(
         weight_matrix weight(
             all_weights.data()+instruction.weight_offset,
             instruction.input_multiplicity,instruction.output_multiplicity);
+        if(merged_unpack) {
+            using merged_matrix=Kokkos::View<
+                Precision**,Kokkos::LayoutRight,
+                Kokkos::MemoryUnmanaged>;
+            merged_matrix merged_input(
+                workspace_->packed_output_flat.data()+merged_offset,
+                instruction.input_multiplicity,columns);
+            KokkosBlas::gemm(
+                "N","N",instruction.path_weight,weight,packed_output,
+                Precision(0),merged_input);
+            merged_offset+=static_cast<std::size_t>(
+                instruction.input_multiplicity)*columns;
+            continue;
+        }
         KokkosBlas::gemm(
             "N","N",instruction.path_weight,weight,packed_output,Precision(0),packed_input);
         if constexpr(std::is_same_v<
@@ -1391,6 +1921,37 @@ void E3LinearKokkosT<Precision>::reverse(
                         +=packed_input(
                             channel,sample*instruction.width+component);
                 });
+    }
+    if(merged_unpack&&merged_block_count>0
+        &&max_merged_elements>0) {
+        auto plan=merged_plan_;
+        auto contributions=merged_contrib_;
+        auto flat=workspace_->packed_output_flat;
+        Kokkos::parallel_for("e3 reverse linear unpack merged",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                {0,0},{merged_block_count,max_merged_elements}),
+            KOKKOS_LAMBDA(int row,int idx) {
+                const int input_offset=plan(row,0);
+                const int input_multiplicity=plan(row,1);
+                const int width=plan(row,2);
+                const int columns=plan(row,3);
+                const int first_contribution=plan(row,4);
+                const int contribution_count=plan(row,5);
+                if(idx>=input_multiplicity*columns) return;
+                const int channel=idx/columns;
+                const int column=idx%columns;
+                const int component=column%width;
+                const int sample=column/width;
+                Precision value=Precision(0);
+                for(int c=0;c<contribution_count;++c) {
+                    const int offset=contributions(first_contribution+c);
+                    if(static_cast<std::size_t>(offset+idx)
+                        <flat.extent(0))
+                        value+=flat(offset+idx);
+                }
+                input_adjoint(sample,input_offset
+                    +channel*width+component)+=value;
+            });
     }
 }
 
@@ -1866,6 +2427,70 @@ E3TensorProductKokkosT<Precision>::E3TensorProductKokkosT(const nlohmann::json& 
         mh1_cuda_channel_team_size_=mh1_cuda_team_size(mh1_multiplicity_);
         mh1_cuda_harmonic_team_size_=mh1_cuda_team_size(mh1_multiplicity_);
         mh1_instruction_count_=instructions.size();
+        {
+            const auto env_int=[](const char* name,int fallback,
+                                  int lower,int upper) {
+                const char* raw=std::getenv(name);
+                if(raw==nullptr||*raw=='\0') return fallback;
+                char* end=nullptr;
+                const long value=std::strtol(raw,&end,10);
+                if(end==raw||value<lower||value>upper) return fallback;
+                return static_cast<int>(value);
+            };
+            const int shared_vec=env_int(
+                "MATOS_MH1_CHANNEL_VEC",4,1,4);
+            mh1_channel_vec_=env_int(
+                "MATOS_MH1_REV_CHANNEL_VEC",shared_vec,1,4);
+            // The four-channel forward kernel measured slower than the scalar
+            // path; keep scalar as the default while the reverse keeps vec=4.
+            mh1_forward_channel_vec_=env_int(
+                "MATOS_MH1_FWD_CHANNEL_VEC",1,1,4);
+            mh1_harmonic_unroll_=env_int(
+                "MATOS_MH1_HARMONIC_UNROLL",4,1,4);
+            const std::size_t count=
+                mh1_instruction_data_host.size()/7;
+            std::vector<std::pair<int,int>> output_intervals;
+            std::vector<std::pair<int,int>> weight_intervals;
+            output_intervals.reserve(count);
+            weight_intervals.reserve(count);
+            for(std::size_t index=0;index<count;++index) {
+                const int output_offset=
+                    mh1_instruction_data_host[7*index+2];
+                const int output_width=
+                    mh1_instruction_data_host[7*index+4];
+                const int weight_offset=
+                    mh1_instruction_data_host[7*index+5];
+                output_intervals.emplace_back(output_offset,
+                    output_offset+mh1_multiplicity_*output_width);
+                weight_intervals.emplace_back(weight_offset,
+                    weight_offset+mh1_multiplicity_);
+            }
+            const auto tiles_exactly=[](std::vector<std::pair<int,int>> intervals,
+                                        int dimension) {
+                std::sort(intervals.begin(),intervals.end());
+                int covered=0;
+                for(const auto& interval:intervals) {
+                    if(interval.first!=covered) return false;
+                    covered=interval.second;
+                }
+                return covered==dimension;
+            };
+            mh1_output_write_through_=
+                output_mask_is_identity_
+                &&tiles_exactly(output_intervals,output_dimension_)
+                &&env_int("MATOS_MH1_WRITE_THROUGH",1,0,1)!=0;
+            mh1_weight_adjoint_fully_written_=
+                tiles_exactly(weight_intervals,weight_size_)
+                &&env_int("MATOS_MH1_WEIGHT_ZERO_ELIDE",1,0,1)!=0;
+#ifdef KOKKOS_ENABLE_CUDA
+            // The float CUDA team path still uses the zero-fill + "+="
+            // contract; keep it on the round-2 behaviour.
+            if constexpr(std::is_same_v<Precision,float>
+                &&std::is_same_v<Kokkos::DefaultExecutionSpace,
+                                 Kokkos::Cuda>)
+                mh1_output_write_through_=false;
+#endif
+        }
         set_kokkos_view(
             mh1_instruction_data,mh1_instruction_data_host,
             mh1_instruction_count_,7);
@@ -2009,7 +2634,9 @@ void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,
     ProfileRegion profile(mh1_fast_path
         ? "symmetrix/mh1/tensor_product/forward"
         : "symmetrix/generic/tensor_product/forward");
-    ordered_kokkos_deep_copy(output,Precision(0)); auto mask=output_mask; auto fixed=internal_weights;
+    if(!(mh1_fast_path&&mh1_output_write_through_))
+        ordered_kokkos_deep_copy(output,Precision(0));
+    auto mask=output_mask; auto fixed=internal_weights;
     if(mh1_fast_path) {
         auto plan=mh1_instruction_data;
         auto paths=mh1_path_weights;
@@ -2018,6 +2645,7 @@ void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,
         auto component_offsets=mh1_component_offsets;
         const int instruction_count=mh1_instruction_count_;
         const int multiplicity=mh1_multiplicity_;
+        const bool write_through=mh1_output_write_through_;
 #ifdef KOKKOS_ENABLE_CUDA
         if constexpr(std::is_same_v<Precision,float>
             &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2062,6 +2690,82 @@ void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,
         return;
         }
 #endif
+        if(mh1_forward_channel_vec_==4) {
+            // Round-3 slice 2: four channels per thread.  The instruction,
+            // entry, component and per-channel accumulation order are all
+            // unchanged; only the channel-invariant values/input_2 loads and
+            // the output store are shared.  With verified disjoint output
+            // blocks the store becomes write-through ("=") instead of the
+            // zero-fill + read-modify-write.
+            Kokkos::parallel_for(
+                "e3 tensor product mh1 fused",
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                    {0,0},{static_cast<int>(input_1.extent(0)),
+                        (multiplicity+3)/4}),
+                KOKKOS_LAMBDA(int sample,int channel_block) {
+                    const int channel_base=channel_block*4;
+                    for(int instruction=0;instruction<instruction_count;
+                        ++instruction) {
+                        const int input_1_offset=plan(instruction,0);
+                        const int input_2_offset=plan(instruction,1);
+                        const int output_offset=plan(instruction,2);
+                        const int input_width=plan(instruction,3);
+                        const int output_width=plan(instruction,4);
+                        const int weight_offset=plan(instruction,5);
+                        const int component_base=plan(instruction,6);
+                        Precision scale[4];
+                        #pragma unroll
+                        for(int t=0;t<4;++t) {
+                            const int channel=channel_base+t;
+                            scale[t]=(channel<multiplicity)
+                                ?paths(instruction)
+                                    *dynamic_weights(
+                                        sample,weight_offset+channel)
+                                :Precision(0);
+                        }
+                        for(int component=0;component<output_width;
+                            ++component) {
+                            Precision result[4]={Precision(0),Precision(0),
+                                Precision(0),Precision(0)};
+                            for(int entry=component_offsets(
+                                    component_base+component);
+                                entry<component_offsets(
+                                    component_base+component+1);++entry) {
+                                const int a=indices(entry,0);
+                                const Precision wigner_value=values(entry);
+                                const Precision second=input_2(sample,
+                                    input_2_offset+indices(entry,1));
+                                #pragma unroll
+                                for(int t=0;t<4;++t) {
+                                    const int channel=channel_base+t;
+                                    if(channel<multiplicity)
+                                        result[t]+=wigner_value
+                                            *input_1(sample,input_1_offset
+                                                +channel*input_width+a)
+                                            *second;
+                                }
+                            }
+                            #pragma unroll
+                            for(int t=0;t<4;++t) {
+                                const int channel=channel_base+t;
+                                if(channel<multiplicity) {
+                                    const int output_index=output_offset
+                                        +channel*output_width+component;
+                                    if(write_through)
+                                        output(sample,output_index)=
+                                            scale[t]*result[t]
+                                                *mask(output_index);
+                                    else
+                                        output(sample,output_index)+=
+                                            scale[t]*result[t]
+                                                *mask(output_index);
+                                }
+                            }
+                        }
+                    }
+                });
+            return;
+        }
         Kokkos::parallel_for(
             "e3 tensor product mh1 fused",
             Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
@@ -2089,8 +2793,12 @@ void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,
                                 *input_2(sample,input_2_offset+indices(entry,1));
                         const int output_index=output_offset
                             +channel*output_width+component;
-                        output(sample,output_index)+=
-                            scale*result*mask(output_index);
+                        if(write_through)
+                            output(sample,output_index)=
+                                scale*result*mask(output_index);
+                        else
+                            output(sample,output_index)+=
+                                scale*result*mask(output_index);
                     }
                 }
             });
@@ -2112,8 +2820,13 @@ void E3TensorProductKokkosT<Precision>::reverse(Kokkos::View<const Precision**,K
         ? "symmetrix/mh1/tensor_product/reverse"
         : "symmetrix/generic/tensor_product/reverse");
     ordered_kokkos_deep_copy(input_1_adjoint,Precision(0));
-    ordered_kokkos_deep_copy(input_2_adjoint,Precision(0));
-    ordered_kokkos_deep_copy(weights_adjoint,Precision(0));
+    // The MH-1 harmonics kernel assigns every input_2_adjoint component and
+    // the fused channel kernel assigns every weights_adjoint index when the
+    // host-side coverage check passes, so both zero-fills are removable.
+    if(!mh1_fast_path)
+        ordered_kokkos_deep_copy(input_2_adjoint,Precision(0));
+    if(!(mh1_fast_path&&mh1_weight_adjoint_fully_written_))
+        ordered_kokkos_deep_copy(weights_adjoint,Precision(0));
     auto mask=output_mask; auto fixed=internal_weights;
     if(mh1_fast_path) {
         auto plan=mh1_instruction_data;
@@ -2214,73 +2927,266 @@ void E3TensorProductKokkosT<Precision>::reverse(Kokkos::View<const Precision**,K
         return;
         }
 #endif
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 fused channels",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                {0,0},{static_cast<int>(input_1.extent(0)),multiplicity}),
-            KOKKOS_LAMBDA(int sample,int channel) {
-                for(int instruction=0;instruction<instruction_count;
-                    ++instruction) {
-                    const int input_1_offset=plan(instruction,0);
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int input_width=plan(instruction,3);
-                    const int output_width=plan(instruction,4);
-                    const int weight_offset=plan(instruction,5);
-                    const int component_base=plan(instruction,6);
-                    const int first_entry=component_offsets(component_base);
-                    const int last_entry=component_offsets(
-                        component_base+output_width);
-                    const Precision weight=dynamic_weights(
-                        sample,weight_offset+channel);
-                    Precision weight_value=Precision(0);
-                    for(int entry=first_entry;entry<last_entry;++entry) {
-                        const int a=indices(entry,0);
-                        const int b=indices(entry,1);
-                        const int c=indices(entry,2);
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        const Precision common=paths(instruction)*values(entry)
-                            *mask(output_index)*output_adjoint(sample,output_index);
-                        const Precision first=input_1(sample,input_1_offset
-                            +channel*input_width+a);
-                        const Precision second=input_2(sample,input_2_offset+b);
-                        input_1_adjoint(sample,input_1_offset
-                            +channel*input_width+a)+=common*weight*second;
-                        weight_value+=common*first*second;
-                    }
-                    weights_adjoint(sample,weight_offset+channel)=weight_value;
-                }
-            });
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 fused harmonics",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                {0,0},{static_cast<int>(input_1.extent(0)),input_2_dimension_}),
-            KOKKOS_LAMBDA(int sample,int component) {
-                Precision result=Precision(0);
-                for(int channel=0;channel<multiplicity;++channel)
-                    for(int term=harmonic_offsets(component);
-                        term<harmonic_offsets(component+1);++term) {
-                        const int instruction=harmonic_terms(term,0);
-                        const int a=harmonic_terms(term,1);
-                        const int c=harmonic_terms(term,2);
+        if(mh1_channel_vec_==4) {
+            // Round-3 slice 1: four channels per thread.  For each
+            // instruction the (channel,a) slots are loaded once, updated in
+            // the original entry order, and flushed once.  Because the
+            // per-slot load happens at instruction entry and entries are
+            // added in the same order, this is bitwise-identical to the
+            // per-entry global read-modify-write.
+            Kokkos::parallel_for(
+                "e3 tensor reverse mh1 fused channels",
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                    {0,0},{static_cast<int>(input_1.extent(0)),
+                        (multiplicity+3)/4}),
+                KOKKOS_LAMBDA(int sample,int channel_block) {
+                    const int channel_base=channel_block*4;
+                    for(int instruction=0;instruction<instruction_count;
+                        ++instruction) {
                         const int input_1_offset=plan(instruction,0);
+                        const int input_2_offset=plan(instruction,1);
                         const int output_offset=plan(instruction,2);
                         const int input_width=plan(instruction,3);
                         const int output_width=plan(instruction,4);
                         const int weight_offset=plan(instruction,5);
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        const Precision common=paths(instruction)
-                            *harmonic_values(term)*mask(output_index)
-                            *output_adjoint(sample,output_index);
-                        result+=common
-                            *dynamic_weights(sample,weight_offset+channel)
-                            *input_1(sample,input_1_offset
-                                +channel*input_width+a);
+                        const int component_base=plan(instruction,6);
+                        const int first_entry=component_offsets(
+                            component_base);
+                        const int last_entry=component_offsets(
+                            component_base+output_width);
+                        Precision weight[4];
+                        Precision weight_value[4]={Precision(0),
+                            Precision(0),Precision(0),Precision(0)};
+                        Precision acc0[4]={Precision(0),Precision(0),
+                            Precision(0),Precision(0)};
+                        Precision acc1[4]={Precision(0),Precision(0),
+                            Precision(0),Precision(0)};
+                        Precision acc2[4]={Precision(0),Precision(0),
+                            Precision(0),Precision(0)};
+                        #pragma unroll
+                        for(int t=0;t<4;++t) {
+                            const int channel=channel_base+t;
+                            const bool active=channel<multiplicity;
+                            weight[t]=active
+                                ?dynamic_weights(
+                                    sample,weight_offset+channel)
+                                :Precision(0);
+                            if(active) {
+                                const int slot=input_1_offset
+                                    +channel*input_width;
+                                if(input_width>0)
+                                    acc0[t]=input_1_adjoint(sample,slot);
+                                if(input_width>1)
+                                    acc1[t]=input_1_adjoint(sample,slot+1);
+                                if(input_width>2)
+                                    acc2[t]=input_1_adjoint(sample,slot+2);
+                            }
+                        }
+                        for(int entry=first_entry;entry<last_entry;++entry) {
+                            const int a=indices(entry,0);
+                            const int b=indices(entry,1);
+                            const int c=indices(entry,2);
+                            const Precision entry_coeff=
+                                paths(instruction)*values(entry);
+                            const Precision second=input_2(
+                                sample,input_2_offset+b);
+                            #pragma unroll
+                            for(int t=0;t<4;++t) {
+                                const int channel=channel_base+t;
+                                if(channel<multiplicity) {
+                                    const int output_index=output_offset
+                                        +channel*output_width+c;
+                                    const Precision common=(entry_coeff
+                                        *mask(output_index))
+                                        *output_adjoint(sample,output_index);
+                                    const Precision first=input_1(sample,
+                                        input_1_offset
+                                            +channel*input_width+a);
+                                    const Precision contribution=
+                                        (common*weight[t])*second;
+                                    if(a==0) acc0[t]+=contribution;
+                                    else if(a==1) acc1[t]+=contribution;
+                                    else acc2[t]+=contribution;
+                                    weight_value[t]+=(common*first)*second;
+                                }
+                            }
+                        }
+                        #pragma unroll
+                        for(int t=0;t<4;++t) {
+                            const int channel=channel_base+t;
+                            if(channel<multiplicity) {
+                                const int slot=input_1_offset
+                                    +channel*input_width;
+                                if(input_width>0)
+                                    input_1_adjoint(sample,slot)=acc0[t];
+                                if(input_width>1)
+                                    input_1_adjoint(sample,slot+1)=acc1[t];
+                                if(input_width>2)
+                                    input_1_adjoint(sample,slot+2)=acc2[t];
+                                weights_adjoint(sample,
+                                    weight_offset+channel)=weight_value[t];
+                            }
+                        }
                     }
-                input_2_adjoint(sample,component)=result;
-            });
+                });
+        } else {
+            Kokkos::parallel_for(
+                "e3 tensor reverse mh1 fused channels",
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                    {0,0},{static_cast<int>(input_1.extent(0)),multiplicity}),
+                KOKKOS_LAMBDA(int sample,int channel) {
+                    for(int instruction=0;instruction<instruction_count;
+                        ++instruction) {
+                        const int input_1_offset=plan(instruction,0);
+                        const int input_2_offset=plan(instruction,1);
+                        const int output_offset=plan(instruction,2);
+                        const int input_width=plan(instruction,3);
+                        const int output_width=plan(instruction,4);
+                        const int weight_offset=plan(instruction,5);
+                        const int component_base=plan(instruction,6);
+                        const int first_entry=component_offsets(component_base);
+                        const int last_entry=component_offsets(
+                            component_base+output_width);
+                        const Precision weight=dynamic_weights(
+                            sample,weight_offset+channel);
+                        Precision weight_value=Precision(0);
+                        for(int entry=first_entry;entry<last_entry;++entry) {
+                            const int a=indices(entry,0);
+                            const int b=indices(entry,1);
+                            const int c=indices(entry,2);
+                            const int output_index=output_offset
+                                +channel*output_width+c;
+                            const Precision common=paths(instruction)
+                                *values(entry)*mask(output_index)
+                                *output_adjoint(sample,output_index);
+                            const Precision first=input_1(sample,input_1_offset
+                                +channel*input_width+a);
+                            const Precision second=input_2(
+                                sample,input_2_offset+b);
+                            input_1_adjoint(sample,input_1_offset
+                                +channel*input_width+a)+=common*weight*second;
+                            weight_value+=common*first*second;
+                        }
+                        weights_adjoint(sample,
+                            weight_offset+channel)=weight_value;
+                    }
+                });
+        }
+        if(mh1_harmonic_unroll_==4) {
+            Kokkos::parallel_for(
+                "e3 tensor reverse mh1 fused harmonics",
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                    {0,0},{static_cast<int>(input_1.extent(0)),
+                        input_2_dimension_}),
+                KOKKOS_LAMBDA(int sample,int component) {
+                    const int first_term=harmonic_offsets(component);
+                    const int last_term=harmonic_offsets(component+1);
+                    Precision r0=Precision(0),r1=Precision(0),
+                        r2=Precision(0),r3=Precision(0);
+                    int channel=0;
+                    for(;channel+3<multiplicity;channel+=4) {
+                        for(int term=first_term;term<last_term;++term) {
+                            const int instruction=harmonic_terms(term,0);
+                            const int a=harmonic_terms(term,1);
+                            const int c=harmonic_terms(term,2);
+                            const int input_1_offset=plan(instruction,0);
+                            const int output_offset=plan(instruction,2);
+                            const int input_width=plan(instruction,3);
+                            const int output_width=plan(instruction,4);
+                            const int weight_offset=plan(instruction,5);
+                            const Precision w0=dynamic_weights(
+                                sample,weight_offset+channel);
+                            const Precision w1=dynamic_weights(
+                                sample,weight_offset+channel+1);
+                            const Precision w2=dynamic_weights(
+                                sample,weight_offset+channel+2);
+                            const Precision w3=dynamic_weights(
+                                sample,weight_offset+channel+3);
+                            const Precision base=paths(instruction)
+                                *harmonic_values(term);
+                            const int oi0=output_offset
+                                +channel*output_width+c;
+                            const int oi1=output_offset
+                                +(channel+1)*output_width+c;
+                            const int oi2=output_offset
+                                +(channel+2)*output_width+c;
+                            const int oi3=output_offset
+                                +(channel+3)*output_width+c;
+                            const Precision c0=(base*mask(oi0))
+                                *output_adjoint(sample,oi0);
+                            const Precision c1=(base*mask(oi1))
+                                *output_adjoint(sample,oi1);
+                            const Precision c2=(base*mask(oi2))
+                                *output_adjoint(sample,oi2);
+                            const Precision c3=(base*mask(oi3))
+                                *output_adjoint(sample,oi3);
+                            r0+=(c0*w0)*input_1(sample,input_1_offset
+                                +channel*input_width+a);
+                            r1+=(c1*w1)*input_1(sample,input_1_offset
+                                +(channel+1)*input_width+a);
+                            r2+=(c2*w2)*input_1(sample,input_1_offset
+                                +(channel+2)*input_width+a);
+                            r3+=(c3*w3)*input_1(sample,input_1_offset
+                                +(channel+3)*input_width+a);
+                        }
+                    }
+                    Precision result=((r0+r1)+r2)+r3;
+                    for(;channel<multiplicity;++channel)
+                        for(int term=first_term;term<last_term;++term) {
+                            const int instruction=harmonic_terms(term,0);
+                            const int a=harmonic_terms(term,1);
+                            const int c=harmonic_terms(term,2);
+                            const int input_1_offset=plan(instruction,0);
+                            const int output_offset=plan(instruction,2);
+                            const int input_width=plan(instruction,3);
+                            const int output_width=plan(instruction,4);
+                            const int weight_offset=plan(instruction,5);
+                            const int output_index=output_offset
+                                +channel*output_width+c;
+                            const Precision common=paths(instruction)
+                                *harmonic_values(term)*mask(output_index)
+                                *output_adjoint(sample,output_index);
+                            result+=common
+                                *dynamic_weights(sample,
+                                    weight_offset+channel)
+                                *input_1(sample,input_1_offset
+                                    +channel*input_width+a);
+                        }
+                    input_2_adjoint(sample,component)=result;
+                });
+        } else {
+            Kokkos::parallel_for(
+                "e3 tensor reverse mh1 fused harmonics",
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                    {0,0},{static_cast<int>(input_1.extent(0)),
+                        input_2_dimension_}),
+                KOKKOS_LAMBDA(int sample,int component) {
+                    Precision result=Precision(0);
+                    for(int channel=0;channel<multiplicity;++channel)
+                        for(int term=harmonic_offsets(component);
+                            term<harmonic_offsets(component+1);++term) {
+                            const int instruction=harmonic_terms(term,0);
+                            const int a=harmonic_terms(term,1);
+                            const int c=harmonic_terms(term,2);
+                            const int input_1_offset=plan(instruction,0);
+                            const int output_offset=plan(instruction,2);
+                            const int input_width=plan(instruction,3);
+                            const int output_width=plan(instruction,4);
+                            const int weight_offset=plan(instruction,5);
+                            const int output_index=output_offset
+                                +channel*output_width+c;
+                            const Precision common=paths(instruction)
+                                *harmonic_values(term)*mask(output_index)
+                                *output_adjoint(sample,output_index);
+                            result+=common
+                                *dynamic_weights(sample,
+                                    weight_offset+channel)
+                                *input_1(sample,input_1_offset
+                                    +channel*input_width+a);
+                        }
+                    input_2_adjoint(sample,component)=result;
+                });
+        }
         return;
     }
     for(const auto instruction:instructions) { auto wigner=instruction.wigner;

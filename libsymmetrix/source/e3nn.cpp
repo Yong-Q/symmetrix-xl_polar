@@ -112,6 +112,9 @@ E3Linear::E3Linear(const nlohmann::json& data)
     int weight_offset = 0;
     for (const auto& entry : data.at("instructions")) {
         auto instruction = parse_instruction(entry, false);
+        // e3nn (>=0.5) encodes bias-only slots as instructions with i_in == -1
+        // (no weight; values live in the separate `bias` field handled above).
+        if (instruction.input_1 == -1) continue;
         if (instruction.input_1 < 0 || instruction.input_1 >= static_cast<int>(input.blocks.size())
             || instruction.output < 0 || instruction.output >= static_cast<int>(output.blocks.size()))
             throw std::invalid_argument("MACE_Nonlinear linear instruction has an invalid irrep index.");

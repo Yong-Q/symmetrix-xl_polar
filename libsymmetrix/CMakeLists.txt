@@ -359,6 +359,7 @@ if(SYMMETRIX_KOKKOS)
         source/mace_nonlinear_kokkos_components.cpp
         source/mace_nonlinear_kokkos_runtime.cpp
         source/mace_nonlinear_kokkos_evaluate.cpp
+        source/mace_polar_kokkos.cpp
         source/multilayer_perceptron_kokkos.cpp
         source/multivariate_polynomial_kokkos.cpp
         source/radial_function_set_kokkos.cpp

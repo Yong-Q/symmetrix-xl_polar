@@ -16,8 +16,18 @@ public:
     struct Workspace {
         Kokkos::View<Precision**,Kokkos::LayoutRight> packed_input,
             packed_output;
+        // Round-3 merged-unpack path: one ragged output block per GEMM
+        // instruction plus a descriptor table, so all unpack kernels collapse
+        // into a single launch.
+        Kokkos::View<Precision*> packed_output_flat;
+        Kokkos::View<int**,Kokkos::LayoutRight> unpack_plan;
+        Kokkos::View<int*> unpack_contrib_offsets;
+        Kokkos::View<Precision*> unpack_scratch;
         std::size_t bytes() const {
-            return sizeof(Precision)*(packed_input.size()+packed_output.size());
+            return sizeof(Precision)*(packed_input.size()+packed_output.size()
+                +packed_output_flat.size()+unpack_scratch.size())
+                +sizeof(int)*(unpack_plan.size()
+                    +unpack_contrib_offsets.size());
         }
     };
     struct Instruction {
@@ -121,10 +131,22 @@ private:
     int input_dimension_=0, output_dimension_=0;
     int active_output_prefix_dimension_=-1;
     bool all_input_blocks_covered_=false,all_output_blocks_covered_=false,
+        output_blocks_disjoint_=false,input_blocks_disjoint_=false,
         output_mask_is_identity_=false,active_output_mask_is_identity_=false,
         uncovered_output_finalization_is_zero_=false;
     std::string profile_name_="unnamed";
     Backend backend_=Backend::automatic;
+    // Cached merged-unpack plans (per layer, per sample count).  evaluate()
+    // and reverse() are const, so the cache members are mutable.  The plan
+    // views must be per layer: the shared Workspace is reused by many layers.
+    mutable int merged_fwd_samples_=-1,merged_fwd_blocks_=0,
+        merged_fwd_max_elements_=0;
+    mutable std::size_t merged_fwd_total_elements_=0;
+    mutable int merged_rev_samples_=-1,merged_rev_blocks_=0,
+        merged_rev_max_elements_=0;
+    mutable std::size_t merged_rev_total_elements_=0;
+    mutable Kokkos::View<int**,Kokkos::LayoutRight> merged_plan_;
+    mutable Kokkos::View<int*> merged_contrib_;
     std::shared_ptr<Workspace> workspace_=std::make_shared<Workspace>();
     std::vector<Instruction> instructions;
     std::vector<RuntimeOutputBlock> runtime_input_blocks;
@@ -318,6 +340,16 @@ private:
     int input_1_dimension_=0,input_2_dimension_=0,output_dimension_=0,weight_size_=0;
     bool mh1_fast_path=false,mh1_direct_node_layout_=false,
         output_mask_is_identity_=false;
+    // Round-3 kernel switches (all keep a scalar/round-2 fallback).
+    // mh1_output_write_through_: the forward instruction output blocks tile
+    // the whole output exactly once, so the zero-fill and read-modify-write
+    // are removable. mh1_weight_adjoint_fully_written_: every
+    // weights_adjoint index is assigned by the reverse channel kernel, so its
+    // zero-fill is removable.
+    bool mh1_output_write_through_=false,
+        mh1_weight_adjoint_fully_written_=false;
+    int mh1_channel_vec_=4,mh1_forward_channel_vec_=1,
+        mh1_harmonic_unroll_=4;
     int mh1_instruction_count_=0,mh1_multiplicity_=0,
         mh1_input_1_angular_dimension_=0,mh1_max_output_width_=0;
     int mh1_cuda_channel_team_size_=0,mh1_cuda_harmonic_team_size_=0;
