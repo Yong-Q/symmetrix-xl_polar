@@ -354,6 +354,7 @@ private:
     int mh1_instruction_count_=0,mh1_multiplicity_=0,
         mh1_input_1_angular_dimension_=0,mh1_max_output_width_=0;
     int mh1_cuda_channel_team_size_=0,mh1_cuda_harmonic_team_size_=0;
+    int mh1_team_channel_vec_=1;
     std::vector<Instruction> instructions;
     std::vector<OutputBlock> output_blocks;
     Kokkos::View<Precision*> internal_weights, output_mask;

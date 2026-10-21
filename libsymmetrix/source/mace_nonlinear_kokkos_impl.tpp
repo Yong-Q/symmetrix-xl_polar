@@ -5406,9 +5406,18 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             const int msg_vec=(msg_env!=nullptr)?std::atoi(msg_env):4;
             if(msg_vec>=4) {
                 const int msg_tiles=(message_width+3)/4;
+                // Keep the feature tile in x so a warp reads contiguous
+                // message rows; the default tiling puts nodes in x and
+                // scatters every warp across different edges.
+                const char* tile_y_env=std::getenv("MATOS_FWD_MSG_TILE_Y");
+                const int msg_tile_x=1;
+                const int msg_tile_y=(tile_y_env!=nullptr)
+                    ?std::atoi(tile_y_env):128;
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>> msg_policy(
+                    {0,0},{num_nodes,msg_tiles},
+                    {msg_tile_x,msg_tile_y});
                 Kokkos::parallel_for("nonlinear gather messages",
-                    Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                        {0,0},{num_nodes,msg_tiles}),
+                    msg_policy,
                     KOKKOS_LAMBDA(int node,int tile) {
                         const int k0=tile*4;
                         Precision a0=Precision(0),a1=Precision(0),

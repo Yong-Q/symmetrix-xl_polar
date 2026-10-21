@@ -2434,6 +2434,11 @@ E3TensorProductKokkosT<Precision>::E3TensorProductKokkosT(const nlohmann::json& 
                 mh1_cuda_harmonic_team_size_=capped;
             }
         }
+        if(const char* vec_env=std::getenv("MATOS_MH1_TEAM_CHANNEL_VEC")) {
+            const int requested=std::atoi(vec_env);
+            if(requested>=1&&requested<=4)
+                mh1_team_channel_vec_=requested;
+        }
         mh1_instruction_count_=instructions.size();
         {
             const auto env_int=[](const char* name,int fallback,
@@ -2658,12 +2663,80 @@ void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,
         if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,
             Kokkos::Cuda>) {
         const int channel_team_size=mh1_cuda_channel_team_size_;
+        const int team_channel_vec=mh1_team_channel_vec_;
         using channel_policy=Kokkos::TeamPolicy<>;
         Kokkos::parallel_for(
             "e3 tensor product mh1 team channels",
             channel_policy(input_1.extent(0),channel_team_size),
             KOKKOS_LAMBDA(const typename channel_policy::member_type& team) {
                 const int sample=team.league_rank();
+                if(team_channel_vec==4) {
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team,(multiplicity+3)/4),
+                        [&](const int channel_block) {
+                    const int channel_base=channel_block*4;
+                    for(int instruction=0;instruction<instruction_count;
+                        ++instruction) {
+                        const int input_1_offset=plan(instruction,0);
+                        const int input_2_offset=plan(instruction,1);
+                        const int output_offset=plan(instruction,2);
+                        const int input_width=plan(instruction,3);
+                        const int output_width=plan(instruction,4);
+                        const int weight_offset=plan(instruction,5);
+                        const int component_base=plan(instruction,6);
+                        Precision scale[4];
+                        #pragma unroll
+                        for(int t=0;t<4;++t) {
+                            const int channel=channel_base+t;
+                            scale[t]=(channel<multiplicity)
+                                ?paths(instruction)
+                                    *dynamic_weights(
+                                        sample,weight_offset+channel)
+                                :Precision(0);
+                        }
+                        for(int component=0;component<output_width;
+                            ++component) {
+                            Precision result[4]={Precision(0),Precision(0),
+                                Precision(0),Precision(0)};
+                            for(int entry=component_offsets(
+                                    component_base+component);
+                                entry<component_offsets(
+                                    component_base+component+1);++entry) {
+                                const int a=indices(entry,0);
+                                const Precision wigner_value=values(entry);
+                                const Precision second=input_2(sample,
+                                    input_2_offset+indices(entry,1));
+                                #pragma unroll
+                                for(int t=0;t<4;++t) {
+                                    const int channel=channel_base+t;
+                                    if(channel<multiplicity)
+                                        result[t]+=wigner_value
+                                            *input_1(sample,input_1_offset
+                                                +channel*input_width+a)
+                                            *second;
+                                }
+                            }
+                            #pragma unroll
+                            for(int t=0;t<4;++t) {
+                                const int channel=channel_base+t;
+                                if(channel<multiplicity) {
+                                    const int output_index=output_offset
+                                        +channel*output_width+component;
+                                    if(write_through)
+                                        output(sample,output_index)=
+                                            scale[t]*result[t]
+                                                *mask(output_index);
+                                    else
+                                        output(sample,output_index)+=
+                                            scale[t]*result[t]
+                                                *mask(output_index);
+                                }
+                            }
+                        }
+                    }
+                    });
+                    return;
+                }
                 Kokkos::parallel_for(
                     Kokkos::TeamThreadRange(team,multiplicity),
                     [&](const int channel) {
