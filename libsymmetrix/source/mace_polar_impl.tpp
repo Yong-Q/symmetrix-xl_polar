@@ -95,6 +95,30 @@ inline bool polar_replay_cache_enabled()
     return value!=nullptr&&std::atoi(value)!=0;
 }
 
+// UVU team tiling.  The uvu inner products stream one node's x1/x2 vector row
+// per (node,u) or (node,v) thread; when tile_m divides a warp exactly, a warp
+// owns one node row and the row load becomes a warp-wide broadcast instead of
+// a 4-sector gather, and the adjoint/weight tile accesses stay coalesced.
+// Both knobs are env-overridable for tuning; the defaults are the measured
+// optimum.  Team size is capped at the CUDA limit (1024).
+inline void uvu_tile_shape(int& tile_n,int& tile_m)
+{
+    int n=32,m=16;
+    if(const char* e=std::getenv("MATOS_UVU_TILE_N")) {
+        const int value=std::atoi(e);
+        if(value>0&&value<=1024) n=value;
+    }
+    if(const char* e=std::getenv("MATOS_UVU_TILE_M")) {
+        const int value=std::atoi(e);
+        if(value>0&&value<=1024) m=value;
+    }
+    while(n*m>1024) {
+        if(m>=n) m/=2; else n/=2;
+    }
+    tile_n=n;
+    tile_m=m;
+}
+
 // P3 模块⑤: sparse_uvu 路径表解析(镜像 field_blocks.py SparseUvuTensorProduct
 // L368-403 的 _path_meta 语义: 每条指令 = (in1_off,in2_off,out_off,w_off,
 // mul1,mul2,mode,d1); mode0=l×l→0(成对收缩/√d1), mode1=l×0→l(标量调制)。
@@ -922,7 +946,8 @@ void MaceNonlinearKokkosT<Precision>::run_polar_pipeline(int num_nodes,
                                 if(sweep_env!=nullptr)
                                     sweep=std::atoi(sweep_env);
                                 if(sweep!=2&&sweep!=4&&sweep!=8) sweep=4;
-                                const int tile_n=64,tile_m=4;
+                                int tile_n=32,tile_m=32;
+                                uvu_tile_shape(tile_n,tile_m);
                                 const int n_tiles=
                                     (num_nodes+tile_n-1)/tile_n;
                                 const int m_tiles=
@@ -1031,7 +1056,12 @@ void MaceNonlinearKokkosT<Precision>::run_polar_pipeline(int num_nodes,
                                             output(node,out_off+u)+=pw*total;
                                         });
                                 } else {
-                                const int stride2=mul2+1;
+                                // Single-pass (sweep=1): stage the weight
+                                // tile in ascending v chunks so the shared
+                                // memory footprint stays bounded while the
+                                // accumulation order is unchanged.
+                                const int stage_v=64;
+                                const int stride2=stage_v+1;
                                 const std::size_t smem=
                                     scratch_view::shmem_size(
                                         tile_m*stride2);
@@ -1050,40 +1080,56 @@ void MaceNonlinearKokkosT<Precision>::run_polar_pipeline(int num_nodes,
                                         scratch_view s(
                                             team.team_scratch(0),
                                             tile_m*stride2);
-                                        for(int idx=team.team_rank();
-                                            idx<tile_m*mul2;
-                                            idx+=team.team_size()) {
-                                            const int uu=idx/mul2,
-                                                vv=idx%mul2;
-                                            const int u=u0+uu;
-                                            s(uu*stride2+vv)=(u<mul1)
-                                                ?weight_view(
-                                                    w_off+u*mul2+vv)
-                                                :Precision(0);
-                                        }
-                                        team.team_barrier();
                                         const int tr=team.team_rank();
                                         const int node=n0+tr/tile_m,
                                             uu=tr%tile_m;
-                                        if(node<num_nodes
-                                            &&u0+uu<mul1) {
-                                            const int u=u0+uu;
-                                            Precision x1v[8];
+                                        const bool active=node<num_nodes
+                                            &&u0+uu<mul1;
+                                        const int u=u0+uu;
+                                        Precision x1v[8];
+                                        if(active)
                                             for(int c=0;c<d1;++c)
                                                 x1v[c]=x1(node,
                                                     in1_off+u*d1+c);
-                                            Precision mixed=Precision(0);
-                                            for(int v=0;v<mul2;++v) {
-                                                Precision pair=Precision(0);
-                                                for(int c=0;c<d1;++c)
-                                                    pair+=x1v[c]
-                                                        *x2(node,
-                                                            in2_off+v*d1+c);
-                                                mixed+=pair*inv_sqrt_d1
-                                                    *s(uu*stride2+v);
+                                        Precision mixed=Precision(0);
+                                        for(int vbegin=0;vbegin<mul2;
+                                            vbegin+=stage_v) {
+                                            const int width=Kokkos::min(
+                                                stage_v,mul2-vbegin);
+                                            for(int idx=tr;
+                                                idx<tile_m*width;
+                                                idx+=team.team_size()) {
+                                                const int uu2=idx/width,
+                                                    vv=idx%width;
+                                                const int u2=u0+uu2;
+                                                s(uu2*stride2+vv)=
+                                                    (u2<mul1)
+                                                    ?weight_view(w_off
+                                                        +u2*mul2
+                                                        +vbegin+vv)
+                                                    :Precision(0);
                                             }
-                                            output(node,out_off+u)+=pw*mixed;
+                                            team.team_barrier();
+                                            if(active) {
+                                                for(int v=0;v<width;++v) {
+                                                    Precision pair=
+                                                        Precision(0);
+                                                    for(int c=0;c<d1;++c)
+                                                        pair+=x1v[c]
+                                                            *x2(node,
+                                                                in2_off
+                                                                    +(vbegin+v)
+                                                                        *d1+c);
+                                                    mixed+=pair
+                                                        *inv_sqrt_d1
+                                                        *s(uu*stride2+v);
+                                                }
+                                            }
+                                            team.team_barrier();
                                         }
+                                        if(active)
+                                            output(node,out_off+u)
+                                                +=pw*mixed;
                                     });
                                 }
                             } else {
@@ -1702,7 +1748,8 @@ void MaceNonlinearKokkosT<Precision>::run_polar_pipeline(int num_nodes,
                             /Kokkos::sqrt(Precision(d1));
                         if(mode==0) {
                             if(d1<=8) {
-                                const int tile_n=64,tile_m=4;
+                                int tile_n=32,tile_m=32;
+                                uvu_tile_shape(tile_n,tile_m);
                                 const int n_tiles=
                                     (nodes+tile_n-1)/tile_n;
                                 const int m_tiles=
@@ -1711,7 +1758,10 @@ void MaceNonlinearKokkosT<Precision>::run_polar_pipeline(int num_nodes,
                                     Kokkos::DefaultExecutionSpace::
                                         scratch_memory_space,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-                                const int stride2=mul2+1;
+                                // Stage the weight tile in ascending v
+                                // chunks: bounded smem, unchanged order.
+                                const int stage_v=64;
+                                const int stride2=stage_v+1;
                                 const std::size_t smem=
                                     scratch_view::shmem_size(
                                         tile_m*stride2);
@@ -1730,39 +1780,56 @@ void MaceNonlinearKokkosT<Precision>::run_polar_pipeline(int num_nodes,
                                         scratch_view s(
                                             team.team_scratch(0),
                                             tile_m*stride2);
-                                        for(int idx=team.team_rank();
-                                            idx<tile_m*mul2;
-                                            idx+=team.team_size()) {
-                                            const int uu=idx/mul2,
-                                                vv=idx%mul2;
-                                            const int u=u0+uu;
-                                            s(uu*stride2+vv)=(u<mul1)
-                                                ?weight_view(
-                                                    w_off+u*mul2+vv)
-                                                :Precision(0);
-                                        }
-                                        team.team_barrier();
                                         const int tr=team.team_rank();
                                         const int node=n0+tr/tile_m,
                                             uu=tr%tile_m;
-                                        if(node<nodes&&u0+uu<mul1) {
-                                            const int u=u0+uu;
-                                            Precision x1v[8];
+                                        const bool active=node<nodes
+                                            &&u0+uu<mul1;
+                                        const int u=u0+uu;
+                                        Precision x1v[8];
+                                        if(active)
                                             for(int c=0;c<d1;++c)
                                                 x1v[c]=x1(node,
                                                     in1_off+u*d1+c);
-                                            Precision mixed=Precision(0);
-                                            for(int v=0;v<mul2;++v) {
-                                                Precision pair=Precision(0);
-                                                for(int c=0;c<d1;++c)
-                                                    pair+=x1v[c]
-                                                        *x2(node,
-                                                            in2_off+v*d1+c);
-                                                mixed+=pair*inv_sqrt_d1
-                                                    *s(uu*stride2+v);
+                                        Precision mixed=Precision(0);
+                                        for(int vbegin=0;vbegin<mul2;
+                                            vbegin+=stage_v) {
+                                            const int width=Kokkos::min(
+                                                stage_v,mul2-vbegin);
+                                            for(int idx=tr;
+                                                idx<tile_m*width;
+                                                idx+=team.team_size()) {
+                                                const int uu2=idx/width,
+                                                    vv=idx%width;
+                                                const int u2=u0+uu2;
+                                                s(uu2*stride2+vv)=
+                                                    (u2<mul1)
+                                                    ?weight_view(w_off
+                                                        +u2*mul2
+                                                        +vbegin+vv)
+                                                    :Precision(0);
                                             }
-                                            output(node,out_off+u)+=pw*mixed;
+                                            team.team_barrier();
+                                            if(active) {
+                                                for(int v=0;v<width;++v) {
+                                                    Precision pair=
+                                                        Precision(0);
+                                                    for(int c=0;c<d1;++c)
+                                                        pair+=x1v[c]
+                                                            *x2(node,
+                                                                in2_off
+                                                                    +(vbegin+v)
+                                                                        *d1+c);
+                                                    mixed+=pair
+                                                        *inv_sqrt_d1
+                                                        *s(uu*stride2+v);
+                                                }
+                                            }
+                                            team.team_barrier();
                                         }
+                                        if(active)
+                                            output(node,out_off+u)
+                                                +=pw*mixed;
                                     });
                             } else {
                             Kokkos::parallel_for("polar le uvu mode0",
@@ -2214,7 +2281,15 @@ void MaceNonlinearKokkosT<Precision>::compute_polar_reverse_forces(
                     int sweep=4;
                     if(sweep_env!=nullptr) sweep=std::atoi(sweep_env);
                     if(sweep!=2&&sweep!=4&&sweep!=8) sweep=4;
-                    const int tile_n=64, tile_m=4;
+                    int tile_n=32, tile_m=32;
+                    uvu_tile_shape(tile_n,tile_m);
+                    if(sweep<=1) {
+                        // Single-pass branch stages the whole weight seam in
+                        // shared memory; keep that tile inside a 32 KB budget.
+                        while(tile_m>1&&static_cast<std::size_t>(tile_m)
+                                *(mul2+1)*sizeof(Precision)>32768)
+                            tile_m/=2;
+                    }
                     const int n_tiles=(num_nodes+tile_n-1)/tile_n;
                     const int m1_tiles=(mul1+tile_m-1)/tile_m;
                     const int m2_tiles=(mul2+tile_m-1)/tile_m;
