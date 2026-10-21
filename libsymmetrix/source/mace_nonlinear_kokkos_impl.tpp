@@ -3559,6 +3559,14 @@ MaceNonlinearKokkosT<Precision>::MaceNonlinearKokkosT(const nlohmann::json& data
         polar_field_feature_norms=toKokkosView("polar field feature norms",
             tensor_values<Precision>(pb.at("configs").at("field_feature_norms")));
         polar_recursion_steps=pb.at("configs").at("num_recursion_steps").get<int>();
+        // Gate experiment: allow a runtime SCF-step override.  The default
+        // remains the checkpoint value; any override must pass the full force
+        // gate before it can be adopted.
+        if(const char* scf_steps_env=std::getenv("MATOS_POLAR_SCF_STEPS")) {
+            const int requested=std::atoi(scf_steps_env);
+            if(requested>=1&&requested<=8)
+                polar_recursion_steps=requested;
+        }
         // ---- 模块⑤: mixer + 更新块(依据 extensions.py L730/L777-866) ----
         for(const auto& value:pb.at("layer_feature_mixer").at("linears"))
             polar_mixer_linears.emplace_back(value);
@@ -7216,7 +7224,13 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         state.edge_messages={};
         auto edge_message_adj=state.edge_message_adj;
         auto local_message_adj=state.message_adj;
-        {
+        // Plan B4: feed the node-owned message adjoint to the convolution
+        // reverse through the edge->target map instead of materializing an
+        // edge-indexed copy.  MATOS_REV_GATHER_FUSE=0 restores the gather.
+        const char* gather_fuse_env=std::getenv("MATOS_REV_GATHER_FUSE");
+        const bool fuse_reverse_gather=!(gather_fuse_env!=nullptr
+            &&std::atoi(gather_fuse_env)==0);
+        if(!fuse_reverse_gather) {
             // Round-3 nonlinear slice: copy four contiguous message features
             // per thread.  The gather is bandwidth-bound; four independent
             // 8-byte loads/stores per thread give the compiler a contiguous
@@ -7265,9 +7279,16 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         ensure_view(state.edge_harmonic_adj,state.edge_harmonic_adj_storage,edges,num_lm);
         ensure_view(state.weight_adj,state.weight_adj_storage,edges,
             interaction.convolution.weight_size());
-        interaction.convolution.reverse(
-            state.edge_up,edge_harmonics,state.weights,state.edge_message_adj,
-            state.edge_up_adj,state.edge_harmonic_adj,state.weight_adj);
+        if(fuse_reverse_gather)
+            interaction.convolution.reverse(
+                state.edge_up,edge_harmonics,state.weights,
+                state.message_adj,state.edge_up_adj,state.edge_harmonic_adj,
+                state.weight_adj,local_targets);
+        else
+            interaction.convolution.reverse(
+                state.edge_up,edge_harmonics,state.weights,
+                state.edge_message_adj,state.edge_up_adj,
+                state.edge_harmonic_adj,state.weight_adj);
         symmetrix_polar_profile_mark_i("rev:conv",layer);
         auto local_up_adj=state.up_adj;
         auto edge_up_adj=state.edge_up_adj;
@@ -7299,8 +7320,36 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             // default; the chunked experiment stays behind an opt-in.
             const bool chunked=cutoff_env!=nullptr
                 &&std::strcmp(cutoff_env,"chunked")==0;
+            const bool team_backend=cutoff_env!=nullptr
+                &&std::strcmp(cutoff_env,"team")==0;
             const int weight_dim=static_cast<int>(weight_adj.extent(1));
-            if(chunked&&weight_dim>64) {
+            if(team_backend) {
+                // Team-per-edge single-stage reduction: parallelizes the k
+                // loop across the team, so the grid is edges teams instead of
+                // the serial per-edge loop.  The summation order differs from
+                // the scalar path (FP64 rounding only).
+                auto cutoff_adjoint=cutoff_adjoint_values;
+                auto cutoffs=local_cutoffs;
+                Kokkos::parallel_for(
+                    "reverse convolution cutoff team",
+                    Kokkos::TeamPolicy<>(edges,64),
+                    KOKKOS_LAMBDA(
+                        const Kokkos::TeamPolicy<>::member_type& team) {
+                        const int edge=team.league_rank();
+                        const Precision cutoff=cutoffs(edge);
+                        Precision value=Precision(0);
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team,weight_dim),
+                            [&](const int k,Precision& acc) {
+                                const Precision adjoint=
+                                    weight_adj(edge,k);
+                                acc+=adjoint*raw_weights(edge,k);
+                                raw_weight_adj(edge,k)=adjoint*cutoff;
+                            },value);
+                        if(team.team_rank()==0)
+                            cutoff_adjoint(edge)+=value;
+                    });
+            } else if(chunked&&weight_dim>64) {
                 // Round-3 slice 5: deterministic two-stage reduction.  Stage
                 // one assigns raw_weight_adj and sums 16 consecutive k per
                 // thread; stage two folds the chunk partials in ascending

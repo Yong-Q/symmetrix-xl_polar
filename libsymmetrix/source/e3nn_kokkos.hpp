@@ -224,7 +224,8 @@ public:
                  Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
                  Kokkos::View<Precision**,Kokkos::LayoutRight> input_1_adjoint,
                  Kokkos::View<Precision**,Kokkos::LayoutRight> input_2_adjoint,
-                 Kokkos::View<Precision**,Kokkos::LayoutRight> weights_adjoint) const;
+                 Kokkos::View<Precision**,Kokkos::LayoutRight> weights_adjoint,
+                 Kokkos::View<const int*> output_gather={}) const;
     // Adds source-node adjoints and overwrites both edge-adjoint outputs.
     bool try_reverse_from_nodes(
         Kokkos::View<const Precision**,Kokkos::LayoutRight> source_node_values,
