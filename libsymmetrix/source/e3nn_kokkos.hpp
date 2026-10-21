@@ -363,6 +363,13 @@ private:
         mh1_input_terms,mh1_input_instruction_term_offsets;
     Kokkos::View<int*> mh1_component_offsets,mh1_harmonic_offsets,
         mh1_input_term_offsets,mh1_input_1_mul_to_ir,mh1_output_mul_to_ir;
+    // Forward "path-grouped" contraction plan: the Wigner x harmonics product
+    // is channel independent, so the forward kernel computes it once per edge
+    // into team scratch and then only applies the per-channel dynamic weight.
+    // mh1_forward_g_base(instruction) is the scratch slot of the first of the
+    // width_1*width_out values; mh1_forward_g_total_ is the scratch length.
+    Kokkos::View<int*> mh1_forward_g_base;
+    int mh1_forward_g_total_=0;
     Kokkos::View<Precision*> mh1_path_weights,mh1_sparse_values,
         mh1_harmonic_values,mh1_input_values,mh1_output_mask_ir_mul;
 };

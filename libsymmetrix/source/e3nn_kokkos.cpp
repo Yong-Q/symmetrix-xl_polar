@@ -2507,6 +2507,24 @@ E3TensorProductKokkosT<Precision>::E3TensorProductKokkosT(const nlohmann::json& 
         set_kokkos_view(
             mh1_instruction_data,mh1_instruction_data_host,
             mh1_instruction_count_,7);
+        {
+            // Path-grouped forward plan: one scratch slot per (instruction,
+            // input component a, output component c).  The slot holds the
+            // channel-independent Wigner x harmonics contraction
+            // g[a,c] = sum_b W[a,b,c]*input_2[b].
+            std::vector<int> g_base_host(
+                static_cast<std::size_t>(mh1_instruction_count_),0);
+            int g_total=0;
+            for(int instruction=0;instruction<mh1_instruction_count_;
+                ++instruction) {
+                g_base_host[static_cast<std::size_t>(instruction)]=g_total;
+                g_total+=mh1_instruction_data_host[7*instruction+3]
+                    *mh1_instruction_data_host[7*instruction+4];
+            }
+            mh1_forward_g_total_=g_total;
+            mh1_forward_g_base=toKokkosView(
+                "e3 mh1 forward g base",g_base_host);
+        }
         mh1_path_weights=toKokkosView(
             "e3 mh1 path weights",mh1_path_weights_host);
         mh1_component_offsets=toKokkosView(
@@ -2662,6 +2680,141 @@ void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,
 #ifdef KOKKOS_ENABLE_CUDA
         if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,
             Kokkos::Cuda>) {
+        if constexpr(std::is_same_v<Precision,double>) {
+            // Path-grouped MH-1 forward: the Wigner x spherical-harmonic side
+            // of every instruction is independent of the channel, so the team
+            // reduces it once per edge into team scratch
+            //     g[a,c] = sum_b W[a,b,c] * input_2[b]
+            // and the per-channel phase then only runs the small input_1 dot
+            // product  sum_a input_1[a] * g[a,c]  before applying the dynamic
+            // weight.  This removes the per-channel re-evaluation of the whole
+            // sparse Wigner plan (indices/values/input_2 loads) that dominated
+            // the previous team kernel.
+            const int g_total=mh1_forward_g_total_;
+            auto g_base=mh1_forward_g_base;
+            // A100 allows at most 48 KiB of per-team scratch; fall back to
+            // the legacy kernel for wider plans instead of failing the launch.
+            const std::size_t g_bytes_probe=
+                static_cast<std::size_t>(g_total)*sizeof(Precision);
+            if(g_total>0&&g_bytes_probe<=48u*1024u) {
+                using g_policy=Kokkos::TeamPolicy<>;
+                using g_member=typename g_policy::member_type;
+                using g_scratch=typename g_member::scratch_memory_space;
+                const std::size_t g_bytes=
+                    static_cast<std::size_t>(g_total)*sizeof(Precision);
+                auto policy=g_policy(input_1.extent(0),
+                        mh1_cuda_channel_team_size_)
+                    .set_scratch_size(0,Kokkos::PerTeam(g_bytes));
+                Kokkos::parallel_for(
+                    "e3 tensor product mh1 team channels",policy,
+                    KOKKOS_LAMBDA(const g_member& team) {
+                    const int sample=team.league_rank();
+                    Kokkos::View<Precision*,g_scratch,
+                        Kokkos::MemoryUnmanaged>
+                        g(team.team_scratch(0),g_total);
+                    for(int instruction=0;instruction<instruction_count;
+                        ++instruction) {
+                        const int input_2_offset=plan(instruction,1);
+                        const int input_width=plan(instruction,3);
+                        const int output_width=plan(instruction,4);
+                        const int component_base=plan(instruction,6);
+                        const int g_offset=g_base(instruction);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team,output_width),
+                            [&](const int component) {
+                            const int begin=component_offsets(
+                                component_base+component);
+                            const int end=component_offsets(
+                                component_base+component+1);
+                            for(int a=0;a<input_width;++a) {
+                                Precision sum=Precision(0);
+                                for(int entry=begin;entry<end;++entry)
+                                    if(indices(entry,0)==a)
+                                        sum+=values(entry)*input_2(sample,
+                                            input_2_offset+indices(entry,1));
+                                g(g_offset+a*output_width+component)=sum;
+                            }
+                        });
+                    }
+                    team.team_barrier();
+                    // Instruction-outer ordering keeps the uniform plan/path
+                    // loads out of the element loop.  The element index is
+                    // lane-contiguous inside each instruction output block
+                    // (flat = channel*output_width + component), so the warp
+                    // stores are fully coalesced.  The former channel-per-
+                    // lane mapping wrote each instruction block at a stride
+                    // of output_width doubles, which spread every warp store
+                    // over output_width 32-byte sectors.
+                    for(int instruction=0;instruction<instruction_count;
+                        ++instruction) {
+                        const int input_1_offset=plan(instruction,0);
+                        const int output_offset=plan(instruction,2);
+                        const int input_width=plan(instruction,3);
+                        const int output_width=plan(instruction,4);
+                        const int weight_offset=plan(instruction,5);
+                        const int g_offset=g_base(instruction);
+                        const Precision path=paths(instruction);
+                        const int flat_count=multiplicity*output_width;
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team,flat_count),
+                            [&](const int flat) {
+                            int channel=0; int component=0;
+                            if(output_width==1) {
+                                channel=flat;
+                            } else if(output_width==3) {
+                                channel=flat/3; component=flat-3*channel;
+                            } else if(output_width==5) {
+                                channel=flat/5; component=flat-5*channel;
+                            } else if(output_width==7) {
+                                channel=flat/7; component=flat-7*channel;
+                            } else {
+                                channel=flat/output_width;
+                                component=flat-channel*output_width;
+                            }
+                            const Precision scale=path
+                                *dynamic_weights(sample,weight_offset+channel);
+                            const int input_base=input_1_offset
+                                +channel*input_width;
+                            // The input_1 values are shared by the output
+                            // components of one channel.  They are pulled into
+                            // registers explicitly because the output store
+                            // aliases the same global address space, so the
+                            // compiler would otherwise reload input_1 for
+                            // every component.
+                            Precision result;
+                            if(input_width==1) {
+                                result=input_1(sample,input_base)
+                                    *g(g_offset+component);
+                            } else if(input_width==2) {
+                                result=input_1(sample,input_base)
+                                        *g(g_offset+component)
+                                    +input_1(sample,input_base+1)
+                                        *g(g_offset+output_width+component);
+                            } else if(input_width==3) {
+                                result=input_1(sample,input_base)
+                                        *g(g_offset+component)
+                                    +input_1(sample,input_base+1)
+                                        *g(g_offset+output_width+component)
+                                    +input_1(sample,input_base+2)
+                                        *g(g_offset+2*output_width+component);
+                            } else {
+                                result=Precision(0);
+                                for(int a=0;a<input_width;++a)
+                                    result+=input_1(sample,input_base+a)
+                                        *g(g_offset+a*output_width+component);
+                            }
+                            const int output_index=output_offset+flat;
+                            if(write_through)
+                                output(sample,output_index)=scale*result;
+                            else
+                                output(sample,output_index)+=
+                                    scale*result*mask(output_index);
+                        });
+                    }
+                });
+                return;
+            }
+        }
         const int channel_team_size=mh1_cuda_channel_team_size_;
         const int team_channel_vec=mh1_team_channel_vec_;
         using channel_policy=Kokkos::TeamPolicy<>;
