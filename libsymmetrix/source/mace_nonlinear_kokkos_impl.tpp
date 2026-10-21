@@ -5352,15 +5352,31 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             auto source_embed=state.source_embeddings;
             auto target_embed=state.target_embeddings;
             auto edge_features=state.edge_features;
-            Kokkos::parallel_for("nonlinear edge features",edges,KOKKOS_LAMBDA(int edge) {
-                int column=0;
-                for(int k=0;k<nb;++k) edge_features(edge,column++)=local_radial(edge,k);
-                const int source=neigh_indices(edge),target=local_targets(edge);
-                for(int k=0;k<source_embed.extent(1);++k)
-                    edge_features(edge,column++)=source_embed(source,k);
-                for(int k=0;k<target_embed.extent(1);++k)
-                    edge_features(edge,column++)=target_embed(target,k);
-            });
+            // Feature columns in x: one block covers 256 consecutive
+            // columns of one edge, so a warp writes contiguous 8-byte
+            // elements.  The per-edge version put edges in x; a warp then
+            // wrote 32 rows 8 KB apart and paid ~32x write amplification.
+            const int source_width=static_cast<int>(
+                source_embed.extent(1));
+            const int target_width=static_cast<int>(
+                target_embed.extent(1));
+            const int radial_width=static_cast<int>(nb);
+            Kokkos::parallel_for("nonlinear edge features",
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                    {0,0},{edges,edge_width},{1,256}),
+                KOKKOS_LAMBDA(int edge,int column) {
+                    if(column<radial_width) {
+                        edge_features(edge,column)=
+                            local_radial(edge,column);
+                    } else if(column<radial_width+source_width) {
+                        edge_features(edge,column)=source_embed(
+                            neigh_indices(edge),column-radial_width);
+                    } else {
+                        edge_features(edge,column)=target_embed(
+                            local_targets(edge),column-radial_width
+                                -source_width);
+                    }
+                });
         }
         symmetrix_polar_profile_mark_i("fwd:conditioning",layer);
 
