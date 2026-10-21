@@ -5388,22 +5388,32 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             interaction.convolution_weights.evaluate_conditioned(
                 radial,state.convolution_contributions,state.raw_weights);
         else interaction.convolution_weights.evaluate(state.edge_features,state.raw_weights);
-        ordered_kokkos_deep_copy(state.weights,state.raw_weights);
         if(!apply_cutoff) {
+            // Fuse the raw->scaled copy with the cutoff scaling: one read of
+            // raw_weights plus one write of weights instead of the previous
+            // copy (read+write) followed by an in-place scale (read+write).
+            // Same elementwise multiply in the same flat order, so the
+            // result is bitwise identical.
             auto weights=state.weights;
+            auto raw_weights=state.raw_weights;
+            const std::size_t weight_width=weights.extent(1);
             Kokkos::parallel_for("nonlinear weight cutoff",weights.size(),
                 KOKKOS_LAMBDA(std::size_t flat) {
-                    const std::size_t edge=flat/weights.extent(1);
-                    weights(edge,flat%weights.extent(1))*=local_cutoffs(edge);
+                    const std::size_t edge=flat/weight_width;
+                    const std::size_t k=flat%weight_width;
+                    weights(edge,k)=raw_weights(edge,k)*local_cutoffs(edge);
                 });
-        }
+        } else ordered_kokkos_deep_copy(state.weights,state.raw_weights);
         symmetrix_polar_profile_mark_i("fwd:weights",layer);
 
         ensure_view(state.edge_up,state.edge_up_storage,edges,up_width);
         auto edge_up=state.edge_up;
         auto up=state.up;
+        // Feature-major tile: keep a warp on one edge row so the gathered
+        // up() row and the edge_up row are both read/written contiguously.
         Kokkos::parallel_for("nonlinear gather edge up",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{edges,up_width}),
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                {0,0},{edges,up_width},{1,128}),
             KOKKOS_LAMBDA(int edge,int k) {
                 edge_up(edge,k)=up(neigh_indices(edge),k);
             });
@@ -7318,8 +7328,12 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         auto local_up_adj=state.up_adj;
         auto edge_up_adj=state.edge_up_adj;
         auto edge_harmonic_adj=state.edge_harmonic_adj;
+        // Feature-major tile as in the forward gather: a warp reads one
+        // contiguous edge_up_adj row and issues its atomics to a contiguous
+        // run of node-update slots instead of 32 strided rows.
         Kokkos::parallel_for("scatter edge up adjoint",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{edges,up_width}),
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                {0,0},{edges,up_width},{1,128}),
             KOKKOS_LAMBDA(int edge,int k) {
                 Kokkos::atomic_add(&local_up_adj(neigh_indices(edge),k),edge_up_adj(edge,k));
             });
