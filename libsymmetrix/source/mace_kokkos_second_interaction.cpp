@@ -2119,11 +2119,29 @@ void MACEKokkos<Precision>::ensure_h1_adjoint_capacity()
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::reset_les_charges(const int num_nodes)
+{
+    const bool async_inference = use_factorized_async_inference();
+    const auto execution_space = async_inference
+        ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
+    if (les_charges.extent(0) < static_cast<std::size_t>(num_nodes))
+        Kokkos::realloc(les_charges, num_nodes);
+    Kokkos::deep_copy(execution_space, les_charges, 0.0);
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::compute_readout_1(
     const int num_nodes,
     const Kokkos::View<const int*> node_types,
     const bool initialize_h1_adjoint)
 {
+    // Tiled plans run readouts per tile/batch, which would reset and
+    // finalize the LES charges repeatedly. Reject them instead of silently
+    // returning wrong charges.
+    if (les_enabled
+        && (single_layer_tiled_plan_active || dual_layer_tiled_plan_active))
+        throw std::runtime_error(
+            "MACE_LES charge readout is not supported by tiled execution plans.");
     const bool async_inference = use_factorized_async_inference();
     const auto execution_space = async_inference
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
@@ -2133,6 +2151,14 @@ void MACEKokkos<Precision>::compute_readout_1(
         else
             Kokkos::deep_copy(H1_adj, 0.0);
     }
+    if (les_enabled) {
+        if (initialize_h1_adjoint)
+            reset_les_charges(num_nodes);
+        else if (les_charges.extent(0)
+                < static_cast<std::size_t>(num_nodes))
+            throw std::logic_error(
+                "MACE_LES charges were not initialized before readout 1.");
+    }
 
     auto num_channels = this->num_channels;
     auto node_energies = this->node_energies;
@@ -2140,6 +2166,9 @@ void MACEKokkos<Precision>::compute_readout_1(
     auto H1 = this->H1;
     auto H1_adj = this->H1_adj;
     auto readout_1_weights = this->readout_1_weights;
+    const bool les_readout_enabled = this->les_enabled;
+    auto les_readout_1_weights = this->les_readout_1_weights;
+    auto les_charges = this->les_charges;
 
     // atomic energies
     Kokkos::parallel_for(
@@ -2157,6 +2186,8 @@ void MACEKokkos<Precision>::compute_readout_1(
         KOKKOS_LAMBDA (const int i) {
         for (int k=0; k<num_channels; ++k) {
             node_energies(i) += readout_1_weights(k) * H1(i,0,k);
+            if (les_readout_enabled)
+                les_charges(i) += les_readout_1_weights(k) * H1(i,0,k);
             if (initialize_h1_adjoint)
                 H1_adj(i,0,k) = readout_1_weights(k);
         }
@@ -2166,6 +2197,12 @@ void MACEKokkos<Precision>::compute_readout_1(
 template <typename Precision>
 void MACEKokkos<Precision>::compute_readout_2(const int num_nodes)
 {
+    // Tiled plans evaluate readout 2 per tile, so the LES charges would only
+    // cover the active tile. Reject them instead of silently wrong charges.
+    if (les_enabled
+        && (single_layer_tiled_plan_active || dual_layer_tiled_plan_active))
+        throw std::runtime_error(
+            "MACE_LES charge readout is not supported by tiled execution plans.");
     const bool async_inference = use_factorized_async_inference();
     const auto execution_space = async_inference
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
@@ -2181,6 +2218,44 @@ void MACEKokkos<Precision>::compute_readout_2(const int num_nodes)
         Kokkos::realloc(readout_2_output, num_nodes);
     auto H2 = Kokkos::subview(this->H2, make_pair(0,num_nodes), Kokkos::ALL);
     auto H2_adj = Kokkos::subview(this->H2_adj, make_pair(0,num_nodes), Kokkos::ALL);
+    // LES readout 2 must consume the FORWARD H2. `use_mh0_adjoint_reuse()`
+    // aliases H2_adj onto H2, and the energy readout's gradient below writes
+    // the adjoint in place; evaluating the LES head afterwards would read the
+    // adjoint instead of the features. Do it first.
+    if (les_enabled) {
+        if (les_charges.extent(0) < static_cast<std::size_t>(num_nodes))
+            throw std::logic_error(
+                "MACE_LES charges were not initialized before readout 2.");
+        if (les_readout_2_output.extent(0)
+                < static_cast<std::size_t>(num_nodes))
+            Kokkos::realloc(les_readout_2_output, num_nodes);
+        auto les_readout_2_output = Kokkos::subview(
+            this->les_readout_2_output, make_pair(0,num_nodes));
+        les_readout_2.evaluate(
+            execution_space, H2, les_readout_2_output, false);
+        // H2 still holds the forward features here. The energy readout
+        // gradient below may write its adjoint into H2 in place when
+        // H2_adj aliases H2 (use_mh0_adjoint_reuse()), so cache the
+        // per-node feature gradient d readout_2/dH2 now, with seed 1.
+        // The per-sample gradient is linear in the output seed, so
+        // apply_les_charge_adjoint() scales it by dE/dq later.
+        if (les_readout_2_feature_grad.extent(0)
+                < static_cast<std::size_t>(num_nodes)
+            || les_readout_2_feature_grad.extent_int(1) != num_channels)
+            Kokkos::realloc(
+                les_readout_2_feature_grad, num_nodes, num_channels);
+        les_readout_2.evaluate_gradient(
+            execution_space, H2, les_readout_2_output,
+            les_readout_2_feature_grad, false);
+        auto les_charges = this->les_charges;
+        Kokkos::parallel_for(
+            "Compute LES Readouts 2",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, 0, num_nodes),
+            KOKKOS_LAMBDA (const int i) {
+            les_charges(i) += les_readout_2_output(i);
+        });
+    }
     if (recompute_readout) {
         readout_2.evaluate_gradient_accumulate_recompute(
             execution_space, H2, node_energies, H2_adj, false);
@@ -2208,6 +2283,120 @@ void MACEKokkos<Precision>::compute_readout_2(const int num_nodes)
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::finalize_les_charges(const int num_nodes)
+{
+    if (!les_enabled)
+        return;
+    if (num_nodes <= 0)
+        return;
+    if (les_charges.extent(0) < static_cast<std::size_t>(num_nodes))
+        throw std::logic_error(
+            "MACE_LES charges were not accumulated before finalization.");
+    const bool async_inference = use_factorized_async_inference();
+    const auto execution_space = async_inference
+        ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
+    auto les_charges = this->les_charges;
+    const double output_scale = les_output_scale;
+    const bool remove_mean = les_remove_mean;
+    double mean_charge = 0.0;
+    if (remove_mean)
+        Kokkos::parallel_reduce(
+            "MACEKokkos::finalize_les_charges_mean",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, 0, num_nodes),
+            KOKKOS_LAMBDA (const int i, double& local_sum) {
+            local_sum += les_charges(i);
+        },
+            mean_charge);
+    mean_charge /= static_cast<double>(num_nodes);
+    Kokkos::parallel_for(
+        "MACEKokkos::finalize_les_charges",
+        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+            execution_space, 0, num_nodes),
+        KOKKOS_LAMBDA (const int i) {
+        double charge = output_scale * les_charges(i);
+        if (remove_mean)
+            charge -= output_scale * mean_charge;
+        les_charges(i) = charge;
+    });
+    Kokkos::fence("MACEKokkos::finalize_les_charges");
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::apply_les_charge_adjoint(const int num_nodes)
+{
+    if (!les_enabled)
+        return;
+    if (num_nodes <= 0)
+        return;
+    if (les_ewald_dE_dq.extent(0) < static_cast<std::size_t>(num_nodes))
+        throw std::logic_error(
+            "MACE_LES charge adjoint ran before the Ewald charge gradient "
+            "was computed.");
+    if (les_charges.extent(0) < static_cast<std::size_t>(num_nodes))
+        throw std::logic_error(
+            "MACE_LES charges were not finalized before the charge adjoint.");
+    if (H2_adj.extent(0) < static_cast<std::size_t>(num_nodes)
+        || H2_adj.extent_int(1) < num_channels)
+        throw std::logic_error(
+            "MACE_LES charge adjoint requires the readout-2 H2 adjoint.");
+    if (les_readout_2_feature_grad.extent(0)
+            < static_cast<std::size_t>(num_nodes)
+        || les_readout_2_feature_grad.extent_int(1) < num_channels)
+        throw std::logic_error(
+            "MACE_LES charge adjoint requires the readout-2 feature "
+            "gradient.");
+    const bool async_inference = use_factorized_async_inference();
+    const auto execution_space = async_inference
+        ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
+    ensure_h1_adjoint_capacity();
+    if (H1_adj.extent(0) < static_cast<std::size_t>(num_nodes)
+        || H1_adj.extent_int(1) < 1
+        || H1_adj.extent_int(2) < num_channels)
+        throw std::logic_error(
+            "MACE_LES charge adjoint requires the readout-1 H1 adjoint.");
+
+    auto dE_dq = this->les_ewald_dE_dq;
+    const double output_scale = les_output_scale;
+    const bool remove_mean = les_remove_mean;
+    double mean_dE_dq = 0.0;
+    if (remove_mean)
+        Kokkos::parallel_reduce(
+            "MACEKokkos::apply_les_charge_adjoint_mean",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, 0, num_nodes),
+            KOKKOS_LAMBDA (const int i, double& local_sum) {
+            local_sum += dE_dq(i);
+        },
+            mean_dE_dq);
+    mean_dE_dq /= static_cast<double>(num_nodes);
+
+    auto H1_adj = this->H1_adj;
+    auto H2_adj = Kokkos::subview(
+        this->H2_adj, make_pair(0,num_nodes), Kokkos::ALL);
+    auto feature_grad = this->les_readout_2_feature_grad;
+    auto les_readout_1_weights = this->les_readout_1_weights;
+    const int channels = num_channels;
+    Kokkos::parallel_for(
+        "MACEKokkos::apply_les_charge_adjoint",
+        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+            execution_space, 0, num_nodes),
+        KOKKOS_LAMBDA (const int i) {
+        // q_final_i = output_scale*(q_raw_i - remove_mean*mean(q_raw)), so
+        // dq_raw_i = output_scale*(dE/dq_final_i
+        //                         - remove_mean*mean(dE/dq_final)).
+        const double dq_raw = output_scale
+            * (dE_dq(i) - (remove_mean ? mean_dE_dq : 0.0));
+        for (int k=0; k<channels; ++k) {
+            H1_adj(i,0,k) += static_cast<Precision>(
+                dq_raw * les_readout_1_weights(k));
+            H2_adj(i,k) += dq_raw * feature_grad(i,k);
+        }
+    });
+    Kokkos::fence("MACEKokkos::apply_les_charge_adjoint");
+}
+
+template <typename Precision>
 double MACEKokkos<Precision>::compute_readouts(
     int num_nodes,
     const Kokkos::View<const int*> node_types,
@@ -2220,6 +2409,8 @@ double MACEKokkos<Precision>::compute_readouts(
     ensure_h1_adjoint_capacity();
     compute_readout_1(num_nodes, node_types, true);
     compute_readout_2(num_nodes);
+    if (les_enabled)
+        finalize_les_charges(num_nodes);
     auto node_energies = this->node_energies;
 
     double energy = 0.0;

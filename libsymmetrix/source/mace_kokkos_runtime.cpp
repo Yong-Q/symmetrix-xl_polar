@@ -3000,6 +3000,9 @@ std::string MACEKokkos<Precision>::single_layer_tiled_admission_reason() const
 #else
     if (!single_layer_readout)
         return "mh0-single-layer-tiled-v1 requires single_layer_readout=true";
+    if (les_enabled)
+        return "mh0-single-layer-tiled-v1 does not support MACE_LES charges: "
+            "the LES readout and Ewald sum need all atoms in one call";
     if (!mace_uses_prepared_execution(streamed_edges))
         return "mh0-single-layer-tiled-v1 requires direct prepared execution";
     if (has_field_coupling)
@@ -3028,6 +3031,9 @@ std::string MACEKokkos<Precision>::dual_layer_tiled_admission_reason() const
 #else
     if (single_layer_readout || num_interactions != 2)
         return "mh0-dual-layer-tiled-v1 requires an ordinary two-layer MACE model";
+    if (les_enabled)
+        return "mh0-dual-layer-tiled-v1 does not support MACE_LES charges: "
+            "the LES readout and Ewald sum need all atoms in one call";
     if (!mace_uses_prepared_execution(streamed_edges))
         return "mh0-dual-layer-tiled-v1 requires direct prepared execution";
     if (has_field_coupling)

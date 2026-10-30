@@ -28,6 +28,8 @@
 #include "memory_kokkos.h"
 #include "neigh_list.h"
 #include "neighbor.h"
+#include <cstdio>
+#include <cstdlib>
 #include "neighbor_kokkos.h"
 #include "platform.h"
 #include "neigh_list_kokkos.h"
@@ -1481,6 +1483,46 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
   if (stable_execution && !rebuild_topology)
     execution_geometry_only_update_count += 1.0;
 
+  // MACE_LES Ewald needs the current owned-node Cartesian positions and the
+  // cell, which the generic streamed evaluator cannot obtain from the
+  // per-edge xyz/r stream. Nodes follow the neighbor-list ilist order
+  // (node_indices), which need not match the local atom order, so gather the
+  // positions in node order. The cell is row-major with lattice vectors on
+  // the rows, matching LesEwaldKokkosT's convention.
+  if (!is_polar_model && mace->les_enabled
+      && num_nodes > 0) {
+    double les_cell[3][3] = {
+      {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+    if (domain->triclinic) {
+      // LAMMPS restricted triclinic h: a=(h0,0,0), b=(h3,h1,0), c=(h4,h5,h2).
+      les_cell[0][0] = domain->h[0];
+      les_cell[1][0] = domain->h[3];
+      les_cell[1][1] = domain->h[1];
+      les_cell[2][0] = domain->h[4];
+      les_cell[2][1] = domain->h[5];
+      les_cell[2][2] = domain->h[2];
+    } else {
+      les_cell[0][0] = domain->boxhi[0] - domain->boxlo[0];
+      les_cell[1][1] = domain->boxhi[1] - domain->boxlo[1];
+      les_cell[2][2] = domain->boxhi[2] - domain->boxlo[2];
+    }
+    if (les_node_positions.extent(0) < static_cast<std::size_t>(3*num_nodes))
+      Kokkos::realloc(les_node_positions, 3*num_nodes);
+    auto les_positions = Kokkos::subview(
+      les_node_positions, Kokkos::make_pair(0, 3*num_nodes));
+    auto d_node_indices = node_indices;
+    Kokkos::parallel_for(
+      "PairSymmetrixMACEKokkos::set_les_node_positions",
+      num_nodes,
+      KOKKOS_LAMBDA (const int ii) {
+        const int i = d_node_indices(ii);
+        les_positions(3*ii) = x(i,0);
+        les_positions(3*ii+1) = x(i,1);
+        les_positions(3*ii+2) = x(i,2);
+      });
+    mace->set_les_ewald_external_geometry(les_positions, les_cell, num_nodes);
+  }
+
   Kokkos::View<double*> node_energies;
   Kokkos::View<double*> node_forces;
   bool polar_enabled = false;
@@ -1525,6 +1567,19 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
     node_forces = mace->node_forces;
     polar_enabled = mace->polar_blocks_enabled();
     polar_forces = mace->polar_node_forces;
+    if (mace->les_enabled && std::getenv("SYMMETRIX_LES_DUMP_CHARGES")) {
+      auto h_node = Kokkos::create_mirror_view_and_copy(
+          Kokkos::HostSpace(), node_indices);
+      auto h_q = Kokkos::create_mirror_view_and_copy(
+          Kokkos::HostSpace(), mace->les_charges);
+      std::FILE* fp = std::fopen("les_charges.txt", "w");
+      if (fp) {
+        for (int ii = 0; ii < num_nodes; ++ii)
+          std::fprintf(fp, "%d %.10g\n", static_cast<int>(h_node(ii)),
+                       static_cast<double>(h_q(ii)));
+        std::fclose(fp);
+      }
+    }
   }
 
   if (eflag_global) {
@@ -1581,6 +1636,22 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
         const int i = node_indices(ii);
         for (int c = 0; c < 3; ++c)
           Kokkos::atomic_add(&f(i,c), polar_forces(3*ii+c));
+      });
+  }
+
+  // LES latent-Ewald forces are per atom, not per directed edge; add them
+  // after the edge scatter. Node ii maps to atom node_indices(ii).
+  if (mace && mace->les_enabled && mace->les_ewald_forces_ready
+      && mace->les_ewald_forces.extent(0)
+          >= 3*static_cast<std::size_t>(num_nodes)) {
+    auto les_forces = mace->les_ewald_forces;
+    Kokkos::parallel_for(
+      "PairSymmetrixMACEKokkos::les_ewald_force_addition",
+      num_nodes,
+      KOKKOS_LAMBDA (const int ii) {
+        const int i = node_indices(ii);
+        for (int c = 0; c < 3; ++c)
+          Kokkos::atomic_add(&f(i,c), les_forces(3*ii+c));
       });
   }
 

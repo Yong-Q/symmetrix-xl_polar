@@ -56,6 +56,28 @@ void MACEKokkos<Precision>::reduce_node_forces(
     if (atom_forces.extent(0) != 3*static_cast<std::size_t>(num_nodes))
         Kokkos::realloc(atom_forces, 3*static_cast<std::size_t>(num_nodes));
     Kokkos::deep_copy(factorized_execution_space, atom_forces, 0.0);
+    if (les_enabled) {
+        // The LES Ewald forces live on atoms, not on directed edges, so they
+        // cannot be carried by node_forces(). Seed atom_forces with them here;
+        // the edge scatter below then adds the MACE pair forces on top.
+        if (!les_ewald_forces_ready || les_ewald_num_nodes != num_nodes
+            || les_ewald_forces.extent(0)
+                < 3*static_cast<std::size_t>(num_nodes))
+            throw std::logic_error(
+                "MACE_LES Ewald atom forces are missing or do not match the "
+                "atom-force reduction extent.");
+        const auto les_forces = les_ewald_forces;
+        const auto seeded_forces = atom_forces;
+        Kokkos::parallel_for(
+            "MACEKokkos::seed_les_ewald_atom_forces",
+            Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+                factorized_execution_space, 0, num_nodes),
+            KOKKOS_LAMBDA (const int atom) {
+                for (int component=0; component<3; ++component)
+                    seeded_forces(3*atom+component) +=
+                        les_forces(3*atom+component);
+            });
+    }
     const auto reduced_forces = atom_forces;
     const auto directed_forces = node_forces;
     const int num_edges = static_cast<int>(edge_sources.extent(0));
@@ -310,6 +332,200 @@ void MACEKokkos<Precision>::reduce_prepared_all_interactions_stress(
             Kokkos::make_pair(std::size_t(0), 3*num_edges)));
 }
 
+// Gate the LES Ewald sum to the monolithic paths. Tiled plans run the
+// readouts per tile and the distributed paths only own a subset of the
+// atoms, so both would produce incomplete/double-counted charges. The
+// materialized path never receives a cell or node positions, so the Ewald
+// lattice sum is not defined there. The generic streamed path is admitted
+// when the all-interactions geometry (or an external host) supplied the
+// current node positions and cell. Throw instead of silently emitting wrong
+// physics.
+template <typename Precision>
+void MACEKokkos<Precision>::require_les_ewald_supported(
+    const int num_nodes) const
+{
+    if (!les_enabled)
+        return;
+    if (single_layer_tiled_plan_active || dual_layer_tiled_plan_active)
+        throw std::runtime_error(
+            "MACE_LES Ewald is not supported by tiled execution plans: the "
+            "charge readout and Ewald sum need all atoms in one call.");
+    // An embedding host (the LAMMPS pair style) can supply the current node
+    // positions and cell directly on any monolithic path (generic, direct,
+    // materialized); then no native prepared geometry is required.
+    if (les_ewald_external_geometry_ready
+        && les_ewald_external_num_nodes == num_nodes)
+        return;
+    if (streamed_edges == MACEStreamedEdgesMode::generic) {
+        // An embedding host (the LAMMPS pair style) can supply the current
+        // node positions and cell directly; then no native all-interactions
+        // geometry is required.
+        if (les_ewald_external_geometry_ready
+            && les_ewald_external_num_nodes == num_nodes)
+            return;
+        if (!les_ewald_generic_positions_ready)
+            throw std::runtime_error(
+                "MACE_LES Ewald on the generic streamed path requires "
+                "current node positions and a cell: evaluate through "
+                "compute_prepared_all_interactions_positions() after "
+                "prepare_all_interactions_geometry().");
+        if (all_interactions_prepared_geometry_graph_generation == 0
+            || all_interactions_prepared_geometry_graph_generation
+                != all_interactions_prepared_graph_generation)
+            throw std::runtime_error(
+                "MACE_LES Ewald requires prepared all-interactions geometry "
+                "(prepare_all_interactions_geometry) so a cell and reference "
+                "positions are available.");
+        if (all_interactions_candidate_node_types.extent(0)
+                != static_cast<std::size_t>(num_nodes)
+            || all_interactions_positions.extent(0)
+                < 3*static_cast<std::size_t>(num_nodes)
+            || all_interactions_cell.extent(0) != 9)
+            throw std::runtime_error(
+                "MACE_LES Ewald requires prepared node positions and a 3x3 "
+                "cell on the generic streamed path.");
+        return;
+    }
+    if (streamed_edges == MACEStreamedEdgesMode::materialized)
+        throw std::runtime_error(
+            "MACE_LES Ewald does not support streamed_edges='materialized': "
+            "that path never receives a cell or node positions. Use "
+            "streamed_edges='direct' or 'generic'.");
+    if (execution_prepared_num_feature_nodes != num_nodes)
+        throw std::runtime_error(
+            "MACE_LES Ewald is not supported by distributed factorized "
+            "evaluation: only a subset of the atoms is present locally.");
+    if (factorized_prepared_geometry_graph_generation == 0
+        || factorized_prepared_geometry_graph_generation
+            != factorized_prepared_graph_generation
+        || factorized_prepared_geometry_uses_shifts)
+        throw std::runtime_error(
+            "MACE_LES Ewald requires the native prepared-geometry path "
+            "(prepare geometry, then update the Cartesian node positions) "
+            "so a cell and current node positions are available.");
+    if (execution_prepared_positions.extent(0)
+            < 3*static_cast<std::size_t>(num_nodes)
+        || execution_prepared_cell_host.extent(0) != 9)
+        throw std::runtime_error(
+            "MACE_LES Ewald requires prepared node positions and a 3x3 cell.");
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::set_les_ewald_external_geometry(
+    Kokkos::View<const double*> positions,
+    const double cell[3][3],
+    const int num_nodes)
+{
+    les_ewald_external_positions = positions;
+    for (int row=0; row<3; ++row)
+        for (int column=0; column<3; ++column)
+            les_ewald_external_cell[3*row + column] = cell[row][column];
+    les_ewald_external_num_nodes = num_nodes;
+    les_ewald_external_geometry_ready =
+        num_nodes > 0
+        && positions.data() != nullptr
+        && positions.extent(0) >= 3*static_cast<std::size_t>(num_nodes);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::fill_les_ewald_geometry(
+    const int num_nodes)
+{
+    const std::size_t position_extent =
+        3*static_cast<std::size_t>(num_nodes);
+    if (les_ewald_external_geometry_ready
+        && les_ewald_external_num_nodes == num_nodes) {
+        // The host supplied current node positions in evaluator node order
+        // and the cell with lattice vectors on the rows. Skip the native or
+        // prepared geometry lookup entirely.
+        les_ewald_positions = les_ewald_external_positions;
+        if (les_ewald_cell_host.extent(0) != 9)
+            les_ewald_cell_host = Kokkos::View<double*,Kokkos::HostSpace>(
+                "MACE_LES Ewald cell", 9);
+        for (int flat=0; flat<9; ++flat)
+            les_ewald_cell_host(flat) = les_ewald_external_cell[flat];
+    } else if (streamed_edges == MACEStreamedEdgesMode::generic) {
+        les_ewald_positions =
+            Kokkos::View<const double*>(all_interactions_positions);
+        if (les_ewald_cell_host.extent(0) != 9)
+            les_ewald_cell_host = Kokkos::View<double*,Kokkos::HostSpace>(
+                "MACE_LES Ewald cell", 9);
+        Kokkos::deep_copy(les_ewald_cell_host, all_interactions_cell);
+    } else {
+        les_ewald_positions =
+            Kokkos::View<const double*>(execution_prepared_positions);
+        les_ewald_cell_host = execution_prepared_cell_host;
+    }
+    if (les_ewald_positions.extent(0) < position_extent
+        || les_ewald_cell_host.extent(0) != 9)
+        throw std::logic_error(
+            "MACE_LES Ewald geometry resolution produced incomplete views.");
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::apply_les_ewald_energy_forces(
+    const int num_nodes)
+{
+    if (!les_enabled || num_nodes <= 0)
+        return;
+    require_les_ewald_supported(num_nodes);
+    fill_les_ewald_geometry(num_nodes);
+    if (les_charges.extent(0) < static_cast<std::size_t>(num_nodes))
+        throw std::logic_error(
+            "MACE_LES Ewald ran before the LES charges were finalized.");
+
+    // Cache the solver parameters on first use (and after a model reload).
+    if (les_ewald.sigma() != les_sigma || les_ewald.dl() != les_dl
+        || les_ewald.remove_self() != les_remove_self)
+        les_ewald.set_params(les_sigma, les_dl, les_remove_self);
+    if (les_ewald.norm_factor() != les_norm_factor)
+        les_ewald.set_norm_factor(les_norm_factor);
+
+    // The engine cell is row-major with lattice vectors on the rows
+    // (cell[3*row + column]), matching LesEwaldKokkosT's convention.
+    Precision cell[3][3];
+    const auto& cell_host = les_ewald_cell_host;
+    for (int row=0; row<3; ++row)
+        for (int column=0; column<3; ++column)
+            cell[row][column] =
+                static_cast<Precision>(cell_host[3*row + column]);
+
+    const std::size_t position_extent =
+        3*static_cast<std::size_t>(num_nodes);
+    const auto positions = Kokkos::subview(
+        les_ewald_positions,
+        Kokkos::make_pair(std::size_t(0), position_extent));
+    if (les_ewald_forces.extent(0) < position_extent)
+        Kokkos::realloc(les_ewald_forces, position_extent);
+    if (les_ewald_dE_dq.extent(0) < static_cast<std::size_t>(num_nodes))
+        Kokkos::realloc(les_ewald_dE_dq, num_nodes);
+
+    // Also fill les_ewald_dE_dq(i) = dE_LR/dq_i. The explicit Ewald forces
+    // above are already the complete position derivative; the charge
+    // gradient is only used to backpropagate through the LES charge
+    // readouts (apply_les_charge_adjoint), avoiding double counting.
+    const Precision les_energy = les_ewald.energy_forces_with_charge_gradient(
+        factorized_execution_space, num_nodes, positions, cell,
+        les_charges, les_ewald_forces, les_ewald_dE_dq);
+
+    // node_energies is a per-node array that the evaluator reduces with a
+    // plain sum (numpy.sum in _collect_mace_results, and
+    // Kokkos::parallel_reduce in compute_readouts when a total is requested),
+    // so parking the reciprocal-space total on node 0 adds it exactly once.
+    const auto energies = node_energies;
+    const double total_energy = static_cast<double>(les_energy);
+    Kokkos::parallel_for(
+        "MACEKokkos::add_les_ewald_energy",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space, 0, 1),
+        KOKKOS_LAMBDA (const int) {
+            energies(0) += total_energy;
+        });
+
+    les_ewald_forces_ready = true;
+    les_ewald_num_nodes = num_nodes;
+}
+
 template <typename Precision>
 void MACEKokkos<Precision>::compute_node_energies_forces(
     const int num_nodes,
@@ -323,6 +539,16 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     const bool streamed_schedule_prepared)
 {
     const auto evaluation_start = std::chrono::steady_clock::now();
+    // Any new evaluation invalidates the Ewald forces from the previous one.
+    les_ewald_forces_ready = false;
+    les_ewald_num_nodes = 0;
+    // The generic streamed path only has cell/positions when it is entered
+    // through compute_prepared_all_interactions_positions(), which refreshes
+    // the all-interactions geometry and passes streamed_schedule_prepared.
+    les_ewald_generic_positions_ready =
+        streamed_edges == MACEStreamedEdgesMode::generic
+        && streamed_schedule_prepared;
+    require_les_ewald_supported(num_nodes);
     if (execution_graph_generation != 0) {
         if (!mace_uses_prepared_execution(streamed_edges))
             throw std::invalid_argument(
@@ -491,6 +717,8 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         compute_M1(num_nodes, node_types);
         compute_H2(num_nodes, node_types);
         compute_readouts(num_nodes, node_types, false, false);
+        apply_les_ewald_energy_forces(num_nodes);
+        apply_les_charge_adjoint(num_nodes);
         reverse_H2(num_nodes, node_types, false);
         reverse_M1(num_nodes, node_types);
     } else {
@@ -528,6 +756,9 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         compute_H2(num_nodes, node_types);
 
         compute_readouts(num_nodes, node_types, false, false);
+
+        apply_les_ewald_energy_forces(num_nodes);
+        apply_les_charge_adjoint(num_nodes);
 
         reverse_H2(num_nodes, node_types, false);
         reverse_M1(num_nodes, node_types);
@@ -1171,6 +1402,10 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
     const std::uint64_t execution_graph_generation)
 {
     const auto evaluation_start = std::chrono::steady_clock::now();
+    if (les_enabled)
+        throw std::runtime_error(
+            "MACE_LES Ewald is not wired into the field-coupled evaluator; "
+            "evaluate the LES model without field coupling.");
     if (!has_field_coupling)
         throw std::invalid_argument("MACEKokkos::compute_node_energies_forces_field requires field coupling.");
     if (execution_graph_generation != 0) {
@@ -1587,6 +1822,11 @@ void MACEKokkos<Precision>::begin_factorized_distributed_evaluation(
     if (factorized_distributed_phase != FactorizedDistributedPhase::idle)
         throw std::logic_error(
             "A factorized distributed evaluation is already active.");
+    if (les_enabled)
+        throw std::runtime_error(
+            "MACE_LES Ewald is not supported by distributed factorized "
+            "evaluation: the charge readout only covers the local atoms and "
+            "the Ewald lattice sum would be incomplete.");
     if (!mace_uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "Distributed prepared evaluation requires streamed_edges='direct'.");

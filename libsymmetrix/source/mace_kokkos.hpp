@@ -31,6 +31,7 @@
 #include "jit_host_plugin.hpp"
 #include "jit_m0_host_plugin.hpp"
 #include "jit_operator_module.hpp"
+#include "les_ewald.hpp"
 #include "tools_kokkos.hpp"
 #include "zbl_kokkos.hpp"
 
@@ -1780,6 +1781,77 @@ void ensure_h1_adjoint_capacity();
 Kokkos::View<double*> readout_1_weights;
 MultilayerPerceptronKokkos readout_2;
 Kokkos::View<double*> readout_2_output;
+
+// Latent Ewald Summation (LES) charge readout. The per-atom latent charges
+// are produced here; the Ewald energy/force kernel consumes them.
+bool les_enabled = false;
+Kokkos::View<double*> les_readout_1_weights;
+MultilayerPerceptronKokkos les_readout_2;
+Kokkos::View<double*> les_readout_2_output;
+Kokkos::View<double*> les_charges;
+double les_output_scale = 1.0;
+double les_sigma = 1.0;
+double les_dl = 2.0;
+double les_norm_factor = 90.4756;
+bool les_remove_mean = true;
+bool les_remove_self = true;
+Kokkos::View<double*> get_les_charges() const { return les_charges; }
+void reset_les_charges(int num_nodes);
+void finalize_les_charges(int num_nodes);
+// Charge adjoint for the LES Ewald term. The Ewald kernel fills
+// les_ewald_dE_dq(i) = dE_LR/dq_i; les_readout_2_feature_grad holds
+// d readout_2/dH2 computed while H2 still holds the forward features (the
+// energy readout gradient may overwrite H2 in place when H2_adj aliases H2).
+// apply_les_charge_adjoint() backpropagates dE_LR/dq through the charge
+// finalization and both LES readouts into H1_adj/H2_adj.
+Kokkos::View<double*> les_ewald_dE_dq;
+Kokkos::View<double**,Kokkos::LayoutRight> les_readout_2_feature_grad;
+void apply_les_charge_adjoint(int num_nodes);
+
+// Cached LES Ewald solver. The reciprocal k-list is rebuilt only when the
+// cell or the LES parameters change. The per-atom Ewald forces are kept in
+// les_ewald_forces (flat 3N, x fastest) and merged into atom_forces by
+// reduce_node_forces(); node_forces stays the directed per-edge array.
+LesEwaldKokkosT<Precision> les_ewald;
+Kokkos::View<double*> les_ewald_forces;
+bool les_ewald_forces_ready = false;
+int les_ewald_num_nodes = 0;
+// Resolved per-evaluation Ewald geometry: a flat 3N node-position view and a
+// row-major 3x3 host cell. fill_les_ewald_geometry() aliases the prepared
+// Execution R1 views on the direct path and copies the all-interactions
+// views into les_ewald_cell_host on the generic streamed path.
+Kokkos::View<const double*> les_ewald_positions;
+Kokkos::View<double*,Kokkos::HostSpace> les_ewald_cell_host;
+// Set by compute_node_energies_forces() for the generic streamed evaluation
+// launched from compute_prepared_all_interactions_positions(), where the
+// current node positions and cell are available.
+bool les_ewald_generic_positions_ready = false;
+// Geometry supplied by an embedding host (currently the LAMMPS pair style)
+// when the evaluator has no native all-interactions/prepared geometry. The
+// positions are a flat 3N Cartesian view with x fastest in evaluator node
+// order; the cell is copied row-major with lattice vectors on the rows.
+// When ready and the node count matches, fill_les_ewald_geometry() uses these
+// views instead of the native/prepared geometry lookup, and the generic
+// streamed path is admitted by require_les_ewald_supported().
+Kokkos::View<const double*> les_ewald_external_positions;
+double les_ewald_external_cell[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+int les_ewald_external_num_nodes = 0;
+bool les_ewald_external_geometry_ready = false;
+void set_les_ewald_external_geometry(
+    Kokkos::View<const double*> positions,
+    const double cell[3][3],
+    int num_nodes);
+// Reject execution paths that cannot provide complete LES charges plus the
+// node positions/cell (tiled, distributed, materialized, unprepared generic).
+void require_les_ewald_supported(int num_nodes) const;
+// Fill les_ewald_positions/les_ewald_cell_host from the active path's
+// geometry. Called once per evaluation before apply_les_ewald_energy_forces().
+void fill_les_ewald_geometry(int num_nodes);
+// Run the LES Ewald sum after compute_readouts() finalized les_charges:
+// adds the reciprocal-space energy to node_energies(0) and stores the
+// per-node forces in les_ewald_forces.
+void apply_les_ewald_energy_forces(int num_nodes);
+
 double compute_readouts(
     int num_nodes,
     const Kokkos::View<const int*> node_types,

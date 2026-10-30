@@ -138,6 +138,9 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   double polar_total_spin = 1.0;
   Kokkos::View<double*> polar_cell;
   Kokkos::View<double*> polar_node_positions;
+  // Flat 3N node positions (x fastest) in evaluator node order, supplied to
+  // MACEKokkos for the MACE_LES Ewald sum on the generic streamed path.
+  Kokkos::View<double*> les_node_positions;
   Kokkos::View<Precision**,Kokkos::LayoutRight> polar_sync_device;
   Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::HostSpace> polar_sync_host;
   int polar_comm_width = 0;

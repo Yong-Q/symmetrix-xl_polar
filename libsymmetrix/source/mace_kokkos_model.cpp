@@ -1254,6 +1254,44 @@ void MACEKokkos<Precision>::load_from_json(
         std::vector<int>{num_channels, readout_2_hidden_size, 1},
         std::vector<std::vector<double>>{readout_2_weights_1, readout_2_weights_2},
         file["readout_2_scale_factor"]);
+    if (file.contains("les_readout_1_weights")) {
+        les_enabled = true;
+        const auto les_readout_1_weights_vec =
+            file["les_readout_1_weights"].get<std::vector<double>>();
+        auto les_readout_2_weights_1 =
+            file["les_readout_2_weights_1"].get<std::vector<double>>();
+        auto les_readout_2_weights_2 =
+            file["les_readout_2_weights_2"].get<std::vector<double>>();
+        const int les_readout_2_hidden_size =
+            file.value("les_readout_2_hidden_size", 16);
+        if (les_readout_1_weights_vec.size()
+                != static_cast<std::size_t>(num_channels)) {
+            throw std::invalid_argument(
+                "MACE_LES readout 1 weights do not match the channel count.");
+        }
+        if (les_readout_2_hidden_size <= 0
+                || les_readout_2_weights_1.size()
+                    != static_cast<std::size_t>(
+                        num_channels * les_readout_2_hidden_size)
+                || les_readout_2_weights_2.size()
+                    != static_cast<std::size_t>(les_readout_2_hidden_size)) {
+            throw std::invalid_argument(
+                "MACE_LES readout 2 weights do not match the declared hidden size.");
+        }
+        les_readout_1_weights = toKokkosView(
+            "les_readout_1_weights", les_readout_1_weights_vec);
+        les_readout_2 = MultilayerPerceptronKokkos(
+            std::vector<int>{num_channels, les_readout_2_hidden_size, 1},
+            std::vector<std::vector<double>>{
+                les_readout_2_weights_1, les_readout_2_weights_2},
+            file["les_readout_2_scale_factor"]);
+        les_output_scale = file.value("les_output_scale", 1.0);
+        les_sigma = file.value("les_sigma_A", 1.0);
+        les_dl = file.value("les_dl_A", 2.0);
+        les_norm_factor = file.value("les_norm_factor", les_norm_factor);
+        les_remove_mean = file.value("les_remove_mean", true);
+        les_remove_self = file.value("les_remove_self_interaction", true);
+    }
     record_phase("readouts");
 }
 
