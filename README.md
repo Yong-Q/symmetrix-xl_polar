@@ -1,37 +1,45 @@
 # symmetrix-polar-les
 
-LES + polar for Symmetrix-XL (the MACELES engine).
+Long-range electrostatics for the Symmetrix **polar** MACE path.
 
-This branch adds **Latent Ewald Summation (LES)** to the Symmetrix **polar**
-MACE path — the model that predicts per-atom latent charges — so the polar
-head is no longer short-range only: the charges get a periodic GTO-Ewald
-long-range term with analytic forces and an analytic charge gradient.
+A polar MACE checkpoint predicts a per-atom latent charge from the local
+neighbourhood.  This branch makes those charges interact through a periodic
+Ewald sum — the **Latent Ewald Summation (LES)** route to MACELES — with
+analytic forces and an analytic charge gradient, so the model is no longer
+short-range only.
 
-Base: upstream `6c5f73b`; the engine change is one commit (`ccdde6b`).
+- base: upstream `6c5f73b`
+- engine change: one commit, 9 files, +1,839 lines
+- builds a LAMMPS pair style (`symmetrix/mace/float32/kk`) and the Symmetrix
+  Python/ASE caller from the same tree
+- upstream documentation: [UPSTREAM_README.md](UPSTREAM_README.md)
 
-## Changes
+## What it adds
 
-| file | change |
+| file | role |
 |---|---|
-| `libsymmetrix/source/les_ewald.hpp` | periodic triclinic GTO-Ewald (σ = 1.0 Å, dl = 2.0 Å) with analytic forces, analytic `dE/dq`, host reference and a charge finite-difference self-test (double 5e-12, float 1.9e-7) |
+| `libsymmetrix/source/les_ewald.hpp` | periodic triclinic GTO-Ewald (σ = 1.0 Å, dl = 2.0 Å): energy, analytic forces, analytic `dE/dq`, host reference and a charge finite-difference self-test (double 5×10⁻¹², float 1.9×10⁻⁷) |
 | `libsymmetrix/source/mace_kokkos.hpp` | `les_ewald_dE_dq`, readout-2 feature gradient, `apply_les_charge_adjoint()`, runtime `les_norm_factor` |
-| `libsymmetrix/source/mace_kokkos_evaluate.cpp` | Ewald energy/forces plus the charge adjoint right after every Ewald call |
-| `libsymmetrix/source/mace_kokkos_second_interaction.cpp` | polar charge readouts: LES readout-2 Jacobian + `apply_les_charge_adjoint()` chaining `q_final = s·(q_raw − m·mean(q_raw))`, seeds `H1_adj/H2_adj` with `dE/dq` |
-| `libsymmetrix/source/mace_kokkos_model.cpp` | parses `les_norm_factor` from the model JSON |
-| `pair_symmetrix/pair_symmetrix_mace_kokkos.{cpp,h}` | LAMMPS box/positions plumbing, Ewald force merge, optional charge dump |
-| `symmetrix/source/symmetrix/extract_maceles.py` | polar checkpoint export: fusion basis, e3nn path normalization, `les_norm_factor`, `MACE_LES` model type |
+| `libsymmetrix/source/mace_kokkos_evaluate.cpp` | Ewald energy/forces and the charge adjoint immediately after every Ewald call, in both single- and two-layer paths |
+| `libsymmetrix/source/mace_kokkos_second_interaction.cpp` | LES readouts (linear H1 + MLP H2), charge finalization, and the adjoint that chains `q_final = s·(q_raw − m·mean(q_raw))` into `H1_adj` / `H2_adj` |
+| `libsymmetrix/source/mace_kokkos_model.cpp` | reads `les_norm_factor` from the model JSON instead of a hard-coded constant |
+| `pair_symmetrix/pair_symmetrix_mace_kokkos.{cpp,h}` | LAMMPS box/position plumbing, Ewald force merge, optional per-atom charge dump |
+| `symmetrix/source/symmetrix/extract_maceles.py` | checkpoint export: fusion basis, e3nn path normalization, `les_norm_factor`, `MACE_LES` model type |
 
-Two bugs fixed relative to a naive LES hookup:
+The force is the full derivative
 
-1. **Missing charge-response force.** The fixed-charge Ewald derivative
-   `−∂E_LR/∂r|_q` alone gave corr 0.42 vs PyTorch at 1,002 atoms.  The engine
-   now also backpropagates `dE_LR/dq` through both LES readouts.
-2. **Hard-coded norm factor.** `kNormFactor = 90.4756` was baked in; the
-   official checkpoint stores `90.0474`.  It is now read from the model.
+```
+F_i = −∂E_local/∂r_i  − ∂E_LR/∂r_i|_q  − Σ_j (∂E_LR/∂q_j)(∂q_j/∂r_i)
+```
 
-## Measured speed (clean A100 80 GB, FP32, `streamed_edges direct`)
+The last term is the charge-response contribution a fixed-charge Ewald
+implementation misses; without it the LES force increment is only 19–54 % of
+the reference at 1,002–1,500 atoms.
 
-µs/atom/step, 15 × 20-step NVT samples per arm; min / median.
+## Measured speed
+
+Clean A100 80 GB, FP32, `streamed_edges direct`, 15 × 20-step NVT samples per
+arm (µs/atom/step, min / median):
 
 | atoms | density (molecules/Å³) | MACELES (LES on) | polar backbone (LES off) | LES overhead |
 |---:|---:|---:|---:|---:|
@@ -39,358 +47,80 @@ Two bugs fixed relative to a naive LES hookup:
 | 1,500 | 0.0334 (water, 1 g/cm³) | **5.37 / 5.71** | 4.46 / 5.40 | +20 % |
 | 5,001 | 0.020 | **4.22 / 4.23** | 2.73 / 2.79 | +54 % |
 
-Six 3,000-atom molecular boxes (single 100-step timings):
+Six 3,000-atom boxes, single 100-step timings:
 
 | system | H₂O | NH₃ | CH₄ | C₂H₄ | C₂H₆ | CO₂ |
 |---|---:|---:|---:|---:|---:|---:|
 | µs/atom/step | 7.93 | 7.90 | 7.00 | 7.05 | 7.24 | 6.60 |
 
-Sustained throughput, 3,000-atom water box (1,000 molecules, 0.0334 Å⁻³,
-300 K, 0.5 fs, 100 ps): 22.88 ms/step = **7.63 µs/atom/step**, i.e. **1 ns ≈
-12.7 h** on one A100.  1,500-atom ambient water: 1 ns ≈ 4.5 h clean, 5.3 h at
-the sustained rate.
+Sustained: a 3,000-atom water box (1,000 molecules, 0.0334 Å⁻³, 300 K, 0.5 fs)
+runs at 22.88 ms/step = **7.63 µs/atom/step**, i.e. **1 ns ≈ 12.7 h** on one
+A100.  The 1,500-atom ambient box reaches 1 ns in ≈4.5 h clean (5.3 h
+sustained).  The LES share grows with box volume (reciprocal-space Ewald work)
+and shrinks with neighbour density, hence +20 % at 1,500 ambient atoms versus
++54 % at 5,001 low-density atoms.
 
-The LES share grows with box volume (reciprocal-space Ewald work) and shrinks
-with neighbour density, which is why the 1,500-atom ambient box shows +20 %
-while low-density 5,001 atoms shows +54 %.
+## Accuracy against the PyTorch reference
 
-## Accuracy vs PyTorch (same checkpoint, FP32 engine)
+Same checkpoint, FP32 engine vs FP32/FP64 PyTorch, identical geometries:
 
-| system | atoms | F MAE (eV/Å) | F max | corr |
+| system | atoms | F MAE (eV/Å) | F max (eV/Å) | corr |
 |---|---:|---:|---:|---:|
-| box | 1,002 | 3.0e-5 | 1.6e-4 | 0.999999 |
-| lattice | 1,500 | 2.4e-5 | 1.3e-4 | 1.000000 |
-| H₂O gas | 96 | 4.4e-5 | 2.1e-4 | 1.000000 |
-| NH₃ gas | 128 | 3.7e-5 | 2.5e-4 | 1.000000 |
-| CH₄ gas | 160 | 2.3e-5 | 2.1e-4 | 1.000000 |
-| C₂H₄ gas | 192 | 3.0e-5 | 2.5e-4 | 1.000000 |
-| C₂H₆ gas | 256 | 2.2e-5 | 1.6e-4 | 1.000000 |
-| CO₂ gas | 96 | 1.4e-4 | 6.9e-4 | 1.000000 |
+| box | 1,002 | 3.0×10⁻⁵ | 1.6×10⁻⁴ | 0.999999 |
+| lattice | 1,500 | 2.4×10⁻⁵ | 1.3×10⁻⁴ | 1.000000 |
+| H₂O gas | 96 | 4.4×10⁻⁵ | 2.1×10⁻⁴ | 1.000000 |
+| NH₃ gas | 128 | 3.7×10⁻⁵ | 2.5×10⁻⁴ | 1.000000 |
+| CH₄ gas | 160 | 2.3×10⁻⁵ | 2.1×10⁻⁴ | 1.000000 |
+| C₂H₄ gas | 192 | 3.0×10⁻⁵ | 2.5×10⁻⁴ | 1.000000 |
+| C₂H₆ gas | 256 | 2.2×10⁻⁵ | 1.6×10⁻⁴ | 1.000000 |
+| CO₂ gas | 96 | 1.4×10⁻⁴ | 6.9×10⁻⁴ | 1.000000 |
 
-Energies agree to −3e-6 meV/atom (1,002) and −7e-6 meV/atom (1,500);
-gas molecules to ≤1.5e-3 meV/atom.
+Energies: −3×10⁻⁶ meV/atom (1,002 atoms), −7×10⁻⁶ meV/atom (1,500 atoms);
+gas molecules agree to ≤1.5×10⁻³ meV/atom.
 
 ## Build
 
 ```bash
-git clone --recurse-submodules -b les-polar \
+git clone --recurse-submodules -b polar-les \
     git@github.com:Yong-Q/symmetrix-xl_polar.git
 cd symmetrix-xl
+
+# LAMMPS pair style
 ./pair_symmetrix/install.sh <lammps-source>
 cmake -S <lammps-source>/cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_MPI=OFF -DPKG_KOKKOS=ON -DKokkos_ENABLE_CUDA=ON \
+      -DKokkos_ENABLE_SERIAL=ON -DCMAKE_CXX_STANDARD=20 \
       -DCMAKE_CXX_COMPILER=<lammps>/lib/kokkos/bin/nvcc_wrapper \
-      -DCMAKE_CUDA_COMPILER=<cuda>/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=80
+      -DCMAKE_CUDA_COMPILER=<cuda>/bin/nvcc \
+      -DCMAKE_CUDA_ARCHITECTURES=80
 cmake --build build -j
 ```
 
-`pair_style symmetrix/mace/float32/kk ... streamed_edges direct` also needs a
-`jit_device_artifact` (`.cubin`) for the checkpoint, built on the target GPU:
+`streamed_edges direct` requires a device artifact for the checkpoint, built on
+the target GPU:
 
 ```bash
 python -m symmetrix.cli.prepare_jit_device_artifact \
     --model maceles.json --precision float32 --lammps-arguments
 ```
 
----
+LAMMPS side:
 
-# Symmetrix-XL
+```lammps
+pair_style symmetrix/mace/float32/kk no_domain_decomposition \
+    streamed_edges direct profile speed \
+    jit_device_artifact <module.cubin> jit_device_blocks_per_compute_unit 8
+```
 
-[![CI](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml?query=branch%3Amain)
-[![Documentation](https://github.com/bonan-group/symmetrix-xl/actions/workflows/docs-pages.yaml/badge.svg)](https://bonan-group.github.io/symmetrix-xl/)
-[![arXiv](https://img.shields.io/badge/arXiv-2610.01036-b31b1b.svg)](https://arxiv.org/abs/2610.01036)
+## Keeping up with upstream
 
-In Symmetrix-XL, **XL** stands for **eXtreme scale, Low latency**.
-
-Symmetrix-XL builds on [Symmetrix](https://github.com/wcwitt/symmetrix), a cross-platform evaluator for MACE models,
-and extends it with scalable, low-latency native execution paths for CPUs and
-GPUs. The Python distribution is named `symmetrix-xl`; the import namespace and
-command-line interface remain `symmetrix`.
-
-The methods, validation, and benchmark protocol are described in the preprint
-[Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models](https://arxiv.org/abs/2610.01036).
-
-Symmetrix-XL preserves the MACE checkpoint's architecture and learned weights
-while changing how its equivariant operations are scheduled, stored, and
-compiled. Its execution strategy has three main components:
-
-1. **Memory-bounded direct execution (a).** Streamed-edge execution avoids
-   retaining broad graph-wide radial and tensor-product edge state by generating
-   each contribution near its point of use, accumulating it into the
-   corresponding receiver, and discarding kernel-local products.
-
-2. **Model-specialized execution with runtime compilation (b).** Symmetrix-XL
-   lowers the checkpoint's fixed sparse coupling structure, coefficients, and
-   tensor layouts into generated CPU, CUDA, or HIP kernels and caches the
-   resulting artifact. Learned model parameters and per-system graph and
-   geometry data remain runtime inputs.
-
-3. **Tiled execution with workspace reuse (c).** For capacity-limited
-   calculations, optional tiled execution partitions receivers and their
-   incident edges into bounded tiles and reuses a tile-local workspace across
-   three sweeps. Inter-layer state remains graph-wide, while larger temporary
-   intermediates are bounded by the active tile. Persistent outputs and
-   inter-layer updates are committed before the workspace is reused.
-
-![Symmetrix-XL execution overview](docs/figures/symmetrix-xl-overview.png)
-
-See the [documentation](https://bonan-group.github.io/symmetrix-xl/) for
-installation, supported workflows, and developer references.
-
-The **frontend** is the Python package, ASE calculator, model-conversion tools,
-and CLI that users interact with. A **backend** is the native CPU/OpenMP, CUDA,
-or HIP extension that performs graph construction and model evaluation. The
-frontend API is shared across backends, while accelerator packages are built for
-specific device architectures. Pre-compiled pip packages are usually the
-simplest choice: they avoid a local C++/Kokkos/CUDA or HIP toolchain build,
-install a tested architecture-matched extension, and make environments easier
-to reproduce. Build from source when no suitable wheel exists or when developing
-the native implementation.
-
-### Demonstrated scale
-
-The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0
-medium checkpoint on cubic SrTiO3, with a 6.0 A model cutoff and a 0.5 A
-neighbor-list skin:
-
-| Execution | A100 80 GB atoms | RTX 5090 32 GB atoms |
-|---|---:|---:|
-| ML-IAP + cuEquivariance | 24,565 | 8,640 |
-| Symmetrix-XL standard streaming | 1,250,235 | 486,680 |
-| Symmetrix-XL tiled streaming | 11,240,455 | 4,152,920 |
-
-Tiled streaming is an explicitly enabled capacity mode; standard streaming
-remains the default. These values are the largest successful capacity-boundary
-probes under the stated protocol, not general capacity guarantees or sustained
-20-step molecular-dynamics results. On 64 A800 GPUs, tiled streaming weak-scaled
-to 703.04 million atoms at 93.81% efficiency.
-
-### Demonstrated speed
-
-A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
-
-| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|
-| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
-
-The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
-an effective cutoff of 6.5 A; the graph policies are therefore not identical.
-
-Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
-reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
-the tested A100 and RTX 5090 workloads. One representative RTX 5090 result uses
-5,000-atom perturbed cubic SrTiO3 with MACE-OMAT-0 medium:
-
-| Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
-|---|---:|---:|
-| MACE-Torch + cuEquivariance through LAMMPS ML-IAP | 12.813 | 1.00x |
-| Symmetrix-XL LAMMPS pair style | 2.559 | 5.01x |
-
-Each value is the median of three 20-step runs after warmup. Both deployments
-used a 6.0 A model cutoff and a 0.5 A neighbor-list skin (6.5 A effective
-neighbor cutoff), with zero neighbor-list rebuilds during the measured block.
-The paper also reports complete ASE energy/forces/stress calls; see the paper
-for the full benchmark protocol and graph-policy details.
-
------
-
-### Quick Start
-
-Symmetrix-XL supports CPU/OpenMP, CUDA, and HIP through separately packaged
-backends. For a normal installation, use the published wheels:
+`polar-les` is one commit on `6c5f73b`.  To follow upstream:
 
 ```bash
-python -m pip install symmetrix-xl
+git remote add upstream https://github.com/bonan-group/symmetrix-xl.git
+git fetch upstream && git rebase upstream/main
 ```
 
-The base `symmetrix-xl` package provides the Python frontend and an x86-64-v3
-CPU/OpenMP backend. It is the required fallback package and needs AVX2, FMA,
-and the other x86-64-v3 CPU features. A CPU-only machine needs no additional
-backend package.
-
-GPU packages are architecture-qualified and can be installed alongside the
-base package. The selector contains the CUDA or ROCm major version and the
-device target:
-
-```bash
-python -m pip install symmetrix-xl-cuda12-sm80   # NVIDIA, compute capability 8.0
-python -m pip install symmetrix-xl-cuda13-sm120  # NVIDIA, compute capability 12.0
-```
-
-Only install a GPU package whose target matches the deployment device. GPU
-packages depend on the matching `symmetrix-xl` frontend and retain the CPU
-fallback; they do not overwrite another installed architecture. NVIDIA
-packages provide the CUDA runtime dependencies through Python packages, but a
-compatible NVIDIA driver is still required. Use `symmetrix backend list` and
-`symmetrix doctor` to inspect and verify the selected backend.
-
-The CLI can resolve and install a published matching GPU wheel automatically:
-
-```bash
-symmetrix backend install --arch auto
-```
-
-Use an explicit selector such as `--arch cuda13-sm120` on a headless or
-multi-GPU host. Automatic selection reports its architecture and toolkit
-resolution, and falls back from a missing CUDA 13 wheel to CUDA 12 when that
-wheel is published. If no published wheel exists, the CLI prints a source-build
-command.
-
-### Source and custom builds
-
-Start from a source checkout to build the CPU backend for the local machine or
-to build a CUDA/HIP target that does not have a published wheel:
-
-Source builds require Python 3.10 or newer, CMake 3.27 or newer, a C++20
-compiler, a Fortran compiler, OpenBLAS or another compatible optimized BLAS,
-and a recursive checkout. CUDA builds additionally require a matching CUDA
-toolkit and `nvcc`; HIP builds require a matching ROCm toolkit and `hipcc`.
-Keep CPU, CUDA, and HIP builds in separate environments and build directories.
-
-```bash
-git clone --recursive https://github.com/bonan-group/symmetrix-xl.git
-cd symmetrix-xl
-uv venv
-source .venv/bin/activate
-python tools/symmetrix_build.py install --backend cpu --cpu-target native
-```
-
-For example, detect the visible NVIDIA GPU architecture and install the
-matching CUDA 13.3 backend:
-
-```bash
-python tools/symmetrix_build.py install --backend cuda \
-    --cuda-root /usr/local/cuda-13.3
-```
-
-Detection requires exactly one visible CUDA architecture. If no GPU is visible
-on the build host, or visible GPUs have different architectures, specify the
-deployment target explicitly, for example `--arch sm120`.
-
-On Apple silicon Macs, a source install builds an FP32 Apple GPU backend;
-see [Apple Metal](docs/user/metal.md).
-
-Inspect the installed backends and test the one selected for the current
-machine:
-
-```bash
-symmetrix backend list
-symmetrix doctor
-```
-
-### ASE calculator
-
-After obtaining a compact JSON model, `Symmetrix` is a drop-in replacement for
-the usual MACECalculator in ASE workflows:
-
-```python
-from ase.spacegroup import crystal
-from symmetrix import Symmetrix
-
-a = 3.905
-atoms = crystal(
-    symbols=["Sr", "Ti", "O"],
-    basis=[(0, 0, 0), (0.5, 0.5, 0.5), (0.5, 0.5, 0)],
-    spacegroup=221,
-    cellpar=[a, a, a, 90, 90, 90],
-)
-atoms.calc = Symmetrix("mace-omat-0-medium.json")
-print(atoms.get_potential_energy())
-print(atoms.get_forces())
-print(atoms.get_stress())
-```
-
-The calculator defaults to FP32 model evaluation with generated direct,
-capacity-aware execution. Pass `dtype="float64"` explicitly for high-precision
-calculations.
-
-Convert a MACE checkpoint to the compact JSON format used by Symmetrix-XL. The
-converter is optional; JSON-only evaluation does not require `mace-torch`.
-
-```bash
-uv pip install mace-torch
-symmetrix_extract_mace \
-    --model mace-omat-0-medium.model \
-    --output mace-omat-0-medium.json
-```
-
-The default is the preferred universal compact export, retaining every element
-supported by the checkpoint. Compact format v2 stores the shared radial model
-once instead of generating pair-specific spline tables, while format v3 also
-retains the complete checkpoint domain. Universal compact files therefore
-avoid quadratic pair-table growth and can be reused across compositions; they
-still include the checkpoint's element-indexed learned parameters. Element
-selectors are intended only for deliberately restricted format-v2 deployments
-or exports in the original Symmetrix pair-spline format (named v1 here);
-format-v3 models reject subsets.
-
-CUDA and HIP backends are installed separately for a matching GPU architecture;
-see the [installation guide](docs/user/installation.md) and [Symmetrix-XL
-package README](symmetrix/README.md) for backend-specific builds.
-
-### LAMMPS integration
-
-See the `pair_symmetrix` [README](pair_symmetrix/README.md) for use from LAMMPS.
-
-### Development Setup
-
-Use `uv` to create a worktree-local environment and install the package with
-its test dependencies. Reuse the environment and editable build directory for
-source iterations:
-
-```bash
-test -x .venv/bin/python || uv venv .venv
-source .venv/bin/activate
-uv pip install scikit-build-core pybind11 ninja
-source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
-uv pip install --no-build-isolation --reinstall-package symmetrix-xl \
-  -e "./symmetrix[test]" \
-  --config-setting="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint"
-```
-
-Run Python formatting and lint checks with `uvx pre-commit run --all-files`.
-
-### Citing Symmetrix-XL
-
-If you use Symmetrix-XL, please cite:
-
-* L. Fu, Z. Feng, Y. Li, H. Du, X. He, J. Wu, K. Bao, Y. Zhang, Z. Deng, Z. Lu, and B. Zhu, "Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models," arXiv:2610.01036 (2026). [[arXiv]](https://arxiv.org/abs/2610.01036)
-
-```bibtex
-@article{fu2026symmetrixxl,
-  title   = {Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models},
-  author  = {Fu, Lei and Feng, Zihui and Li, Yongheng and Du, Hongwei and He, Xin and Wu, Junyi and Bao, Kejie and Zhang, Yueyu and Deng, Zeyu and Lu, Ziheng and Zhu, Bonan},
-  journal = {arXiv preprint arXiv:2610.01036},
-  year    = {2026}
-}
-```
-
-Symmetrix-XL builds on the original Symmetrix project. The earliest `symmetrix`
-results are reported in:
-* D. P. Kovács, J. H. Moore, N. J. Browning, I. Batatia, J. T. Horton, Y. Pu, V. Kapil, W. C. Witt, I.-B. Magdău, D. J. Cole, G. Csányi, "MACE-OFF: Short-Range Transferable Machine Learning Force Fields for Organic Molecules", _Journal of the American Chemical Society_ **147**, 17598 (2025). [[arxiv]](https://arxiv.org/abs/2312.15211) [[journal]](https://doi.org/10.1021/jacs.4c07099)
-
-MACE foundation models and implementations are described in:
-* I. Batatia, P. Benner, Y. Chiang, A. M. Elena, D. P. Kovács, J. Riebesell, ...+78 others..., W. C. Witt, T. Wolf, F. Zills, G. Csányi, "A foundation model for atomistic materials chemistry," _Journal of Chemical Physics_ **163**, 184110 (2025). [[arxiv]](https://arxiv.org/abs/2401.00096) [[journal]](https://doi.org/10.1063/5.0297006)
-
-Please also cite the model-specific references appropriate to the MACE checkpoint
-you use.
-
-### Licensing
-
-The default license for this project is the [MIT License](./LICENSE).
-
-The `pair_symmetrix` subdirectory, which enables integration with LAMMPS,
-is licensed under the [GNU General Public License (GPLv2)](pair_symmetrix/LICENSE)
-to maintain consistency with LAMMPS.
-
-### Acknowledgements
-
-Symmetrix-XL is based on [Symmetrix](https://github.com/wcwitt/symmetrix),
-developed by William C. Witt.
-
-The original Symmetrix project also has the following acknowledgement statement:
-
-An early phase of this project, leading to the Kokkos-based MACE implementation, was supported by the Schmidt Sciences Virtual Institute for Scientific Software (VISS). This engagement involved key contributions from Dave Brownell and Ketan Bhardwaj of the Center for Scientific and Software Engineering at Georgia Tech.
+A rebase only touches the 9 LES files; re-run the force/energy comparison
+above whenever `les_ewald.hpp`, `mace_kokkos*`, `pair_symmetrix_*` or
+`extract_maceles.py` change.
