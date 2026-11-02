@@ -1,18 +1,26 @@
 # symmetrix-polar-les
 
-Long-range electrostatics for the Symmetrix **polar** MACE path.
+**MACELES — MACE with Latent Ewald Summation — on the Symmetrix polar backbone.**
 
-A polar MACE checkpoint predicts a per-atom latent charge from the local
-neighbourhood.  This branch makes those charges interact through a periodic
-Ewald sum — the **Latent Ewald Summation (LES)** route to MACELES — with
-analytic forces and an analytic charge gradient, so the model is no longer
-short-range only.
+Polar MACE checkpoints predict a per-atom latent charge from the local
+neighbourhood, but keep the interaction short-ranged.  This branch adds the
+missing long-range electrostatics: those latent charges interact through a
+periodic GTO-Ewald sum, with analytic forces that include the charge-response
+term, and it runs at production speed inside LAMMPS.
 
-- base: upstream `6c5f73b`
-- engine change: one commit, 9 files, +1,839 lines
-- builds a LAMMPS pair style (`symmetrix/mace/float32/kk`) and the Symmetrix
-  Python/ASE caller from the same tree
-- upstream documentation: [UPSTREAM_README.md](UPSTREAM_README.md)
+## Highlights
+
+- **Complete force derivative** — local term, fixed-charge Ewald term, and the
+  charge-response adjoint `Σ_j (∂E_LR/∂q_j)(∂q_j/∂r_i)` that a naive Ewald
+  hookup drops.
+- **Production speed** — 5–8 µs/atom/step on one A100 with LES on; the LES
+  overhead is +20 % to +54 % depending on box volume and neighbour density.
+- **Matches the reference** — 2×10⁻⁵–1×10⁻⁴ eV/Å force MAE against PyTorch on
+  identical geometries, correlation ≥ 0.99999.
+- **One commit on upstream `6c5f73b`** — 9 files, +1,839 lines; rebases onto
+  upstream without touching anything outside the LES path.
+
+Maintained by [@Yong-Q](https://github.com/Yong-Q).
 
 ## What it adds
 
