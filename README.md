@@ -1,9 +1,11 @@
-# MACELES-LES branch
+# LES + polar (MACELES)
 
-This branch adds Latent Ewald Summation (LES) to the Symmetrix MACE path so a
-MACE checkpoint that predicts latent charges gets a long-range electrostatic
-term with analytic forces.  Base: upstream `6c5f73b`; the engine change is one
-commit (`ccdde6b`).
+This branch adds **Latent Ewald Summation (LES)** to the Symmetrix **polar**
+MACE path — the model that predicts per-atom latent charges — so the polar
+head is no longer short-range only: the charges get a periodic GTO-Ewald
+long-range term with analytic forces and an analytic charge gradient.
+
+Base: upstream `6c5f73b`; the engine change is one commit (`ccdde6b`).
 
 ## Changes
 
@@ -12,10 +14,10 @@ commit (`ccdde6b`).
 | `libsymmetrix/source/les_ewald.hpp` | periodic triclinic GTO-Ewald (σ = 1.0 Å, dl = 2.0 Å) with analytic forces, analytic `dE/dq`, host reference and a charge finite-difference self-test (double 5e-12, float 1.9e-7) |
 | `libsymmetrix/source/mace_kokkos.hpp` | `les_ewald_dE_dq`, readout-2 feature gradient, `apply_les_charge_adjoint()`, runtime `les_norm_factor` |
 | `libsymmetrix/source/mace_kokkos_evaluate.cpp` | Ewald energy/forces plus the charge adjoint right after every Ewald call |
-| `libsymmetrix/source/mace_kokkos_second_interaction.cpp` | LES readout-2 Jacobian + `apply_les_charge_adjoint()`: chains `q_final = s·(q_raw − m·mean(q_raw))` and seeds `H1_adj/H2_adj` with `dE/dq` |
+| `libsymmetrix/source/mace_kokkos_second_interaction.cpp` | polar charge readouts: LES readout-2 Jacobian + `apply_les_charge_adjoint()` chaining `q_final = s·(q_raw − m·mean(q_raw))`, seeds `H1_adj/H2_adj` with `dE/dq` |
 | `libsymmetrix/source/mace_kokkos_model.cpp` | parses `les_norm_factor` from the model JSON |
 | `pair_symmetrix/pair_symmetrix_mace_kokkos.{cpp,h}` | LAMMPS box/positions plumbing, Ewald force merge, optional charge dump |
-| `symmetrix/source/symmetrix/extract_maceles.py` | checkpoint export: fusion basis, e3nn path normalization, `les_norm_factor`, `MACE_LES` model type |
+| `symmetrix/source/symmetrix/extract_maceles.py` | polar checkpoint export: fusion basis, e3nn path normalization, `les_norm_factor`, `MACE_LES` model type |
 
 Two bugs fixed relative to a naive LES hookup:
 
