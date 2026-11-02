@@ -38,45 +38,40 @@ the reference at 1,002–1,500 atoms.
 
 ## Measured speed
 
-Clean A100 80 GB, FP32, `streamed_edges direct`, 15 × 20-step NVT samples per
-arm (µs/atom/step, min / median):
+Clean A100 80 GB, FP32, `streamed_edges direct`, 15 x 20-step NVT samples per
+arm (us/atom/step, min / median):
 
-| atoms | density (molecules/Å³) | MACELES (LES on) | polar backbone (LES off) | LES overhead |
-|---:|---:|---:|---:|---:|
-| 1,002 | 0.020 | 5.09 / 5.42 | 3.66 / 4.01 | +39 % |
-| 1,500 | 0.0334 (water, 1 g/cm³) | **5.37 / 5.71** | 4.46 / 5.40 | +20 % |
-| 5,001 | 0.020 | **4.22 / 4.23** | 2.73 / 2.79 | +54 % |
+| atoms | MACELES (LES on) | backbone (LES off) | LES overhead |
+|---:|---:|---:|---:|
+| ~1,000 | 5.09 / 5.42 | 3.66 / 4.01 | +39 % |
+| ~1,500 | **5.37 / 5.71** | 4.46 / 5.40 | +20 % |
+| ~5,000 | **4.22 / 4.23** | 2.73 / 2.79 | +54 % |
 
-Six 3,000-atom boxes, single 100-step timings:
+3,000-atom boxes of several molecular species: **6.6-7.9 us/atom/step**
+with LES on, i.e. the same ballpark as the smaller boxes.
 
-| system | H₂O | NH₃ | CH₄ | C₂H₄ | C₂H₆ | CO₂ |
-|---|---:|---:|---:|---:|---:|---:|
-| µs/atom/step | 7.93 | 7.90 | 7.00 | 7.05 | 7.24 | 6.60 |
+Sustained run, 3,000-atom box, 0.5 fs: **22.9 ms/step = 7.6 us/atom/step**,
+so **1 ns takes about 12.7 h on one A100**.  The 1,500-atom box reaches 1 ns in
+about 4.5 h clean (5.3 h sustained).
 
-Sustained: a 3,000-atom water box (1,000 molecules, 0.0334 Å⁻³, 300 K, 0.5 fs)
-runs at 22.88 ms/step = **7.63 µs/atom/step**, i.e. **1 ns ≈ 12.7 h** on one
-A100.  The 1,500-atom ambient box reaches 1 ns in ≈4.5 h clean (5.3 h
-sustained).  The LES share grows with box volume (reciprocal-space Ewald work)
-and shrinks with neighbour density, hence +20 % at 1,500 ambient atoms versus
-+54 % at 5,001 low-density atoms.
+The LES share grows with box volume (reciprocal-space Ewald work) and shrinks
+with neighbour density, which is why the smaller dense box shows +20 % while
+the low-density 5,000-atom box shows +54 %.
 
 ## Accuracy against the PyTorch reference
 
-Same checkpoint, FP32 engine vs FP32/FP64 PyTorch, identical geometries:
+Same checkpoint, FP32 engine vs FP32/FP64 PyTorch, identical geometries, on
+systems between 96 and 1,500 atoms (bulk boxes and isolated molecules):
 
-| system | atoms | F MAE (eV/Å) | F max (eV/Å) | corr |
-|---|---:|---:|---:|---:|
-| box | 1,002 | 3.0×10⁻⁵ | 1.6×10⁻⁴ | 0.999999 |
-| lattice | 1,500 | 2.4×10⁻⁵ | 1.3×10⁻⁴ | 1.000000 |
-| H₂O gas | 96 | 4.4×10⁻⁵ | 2.1×10⁻⁴ | 1.000000 |
-| NH₃ gas | 128 | 3.7×10⁻⁵ | 2.5×10⁻⁴ | 1.000000 |
-| CH₄ gas | 160 | 2.3×10⁻⁵ | 2.1×10⁻⁴ | 1.000000 |
-| C₂H₄ gas | 192 | 3.0×10⁻⁵ | 2.5×10⁻⁴ | 1.000000 |
-| C₂H₆ gas | 256 | 2.2×10⁻⁵ | 1.6×10⁻⁴ | 1.000000 |
-| CO₂ gas | 96 | 1.4×10⁻⁴ | 6.9×10⁻⁴ | 1.000000 |
+| quantity | range |
+|---|---|
+| force MAE | **2.2 x 10^-5 - 1.4 x 10^-4 eV/A** |
+| force max | 1.3 x 10^-4 - 6.9 x 10^-4 eV/A |
+| force correlation | **>= 0.99999** |
+| energy | <= 7 x 10^-6 meV/atom |
 
-Energies: −3×10⁻⁶ meV/atom (1,002 atoms), −7×10⁻⁶ meV/atom (1,500 atoms);
-gas molecules agree to ≤1.5×10⁻³ meV/atom.
+The largest deviation is on a small isolated molecule, where the per-atom
+reference forces are ~1 eV/A.
 
 ## Build
 
