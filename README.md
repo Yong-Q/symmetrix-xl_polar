@@ -1,26 +1,34 @@
-# symmetrix-polar-les
+<p align="center">
+  <b>symmetrix-polar-les</b><br>
+  <sub>MACELES &mdash; MACE with Latent Ewald Summation &mdash; on the Symmetrix polar backbone</sub>
+</p>
 
-**MACELES — MACE with Latent Ewald Summation — on the Symmetrix polar backbone.**
+<p align="center">
+  <a href="#build"><img alt="base" src="https://img.shields.io/badge/base-6c5f73b-blue"></a>
+  <img alt="diff" src="https://img.shields.io/badge/patch-9%20files%20%2B1%2C839%20lines-lightgrey">
+  <img alt="speed" src="https://img.shields.io/badge/A100-5--8%20%C2%B5s%2Fatom%2Fstep-brightgreen">
+  <img alt="force" src="https://img.shields.io/badge/force%20MAE-2e--5%E2%80%931.4e--4%20eV%2F%C3%85-success">
+  <img alt="corr" src="https://img.shields.io/badge/corr-%E2%89%A5%200.99999-informational">
+  <img alt="license" src="https://img.shields.io/github/license/Yong-Q/symmetrix-xl_polar">
+</p>
 
-Polar MACE checkpoints predict a per-atom latent charge from the local
-neighbourhood, but keep the interaction short-ranged.  This branch adds the
-missing long-range electrostatics: those latent charges interact through a
-periodic GTO-Ewald sum, with analytic forces that include the charge-response
-term, and it runs at production speed inside LAMMPS.
+> [!IMPORTANT]
+> A polar MACE checkpoint predicts a per-atom latent charge from the local
+> neighbourhood, but keeps the interaction **short-ranged**. This branch adds the
+> missing long range: those charges interact through a **periodic GTO-Ewald sum**,
+> with **analytic forces that include the charge-response term**, and it runs at
+> production speed inside LAMMPS.
 
 ## Highlights
 
-- **Complete force derivative** — local term, fixed-charge Ewald term, and the
-  charge-response adjoint `Σ_j (∂E_LR/∂q_j)(∂q_j/∂r_i)` that a naive Ewald
-  hookup drops.
-- **Production speed** — 5–8 µs/atom/step on one A100 with LES on; the LES
-  overhead is +20 % to +54 % depending on box volume and neighbour density.
-- **Matches the reference** — 2×10⁻⁵–1×10⁻⁴ eV/Å force MAE against PyTorch on
-  identical geometries, correlation ≥ 0.99999.
-- **One commit on upstream `6c5f73b`** — 9 files, +1,839 lines; rebases onto
-  upstream without touching anything outside the LES path.
+| | |
+|---|---|
+| **Complete force** | local + fixed-charge Ewald + the charge-response adjoint `Σⱼ (∂E_LR/∂qⱼ)(∂qⱼ/∂rᵢ)` that a naive Ewald hookup drops |
+| **Fast** | **5–8 µs/atom/step** on one A100 with LES on; overhead **+20 % … +54 %** over the polar backbone |
+| **Accurate** | force MAE **2×10⁻⁵ … 1.4×10⁻⁴ eV/Å** vs PyTorch on identical geometries, correlation **≥ 0.99999** |
+| **Small patch** | **one commit** on upstream `6c5f73b` — **9 files, +1,839 lines**, nothing outside the LES path |
 
-Maintained by [@Yong-Q](https://github.com/Yong-Q).
+<p align="center"><sub>Maintained by <a href="https://github.com/Yong-Q">@Yong-Q</a></sub></p>
 
 ## What it adds
 
@@ -34,15 +42,18 @@ Maintained by [@Yong-Q](https://github.com/Yong-Q).
 | `pair_symmetrix/pair_symmetrix_mace_kokkos.{cpp,h}` | LAMMPS box/position plumbing, Ewald force merge, optional per-atom charge dump |
 | `symmetrix/source/symmetrix/extract_maceles.py` | checkpoint export: fusion basis, e3nn path normalization, `les_norm_factor`, `MACE_LES` model type |
 
-The force is the full derivative
+The force is the **full derivative**:
 
-```
-F_i = −∂E_local/∂r_i  − ∂E_LR/∂r_i|_q  − Σ_j (∂E_LR/∂q_j)(∂q_j/∂r_i)
-```
+$$
+\mathbf{F}_i \;=\; -\frac{\partial E_{\text{local}}}{\partial \mathbf{r}_i}
+\;-\;\left.\frac{\partial E_{\text{LR}}}{\partial \mathbf{r}_i}\right|_q
+\;-\;\sum_j \frac{\partial E_{\text{LR}}}{\partial q_j}\,\frac{\partial q_j}{\partial \mathbf{r}_i}
+$$
 
-The last term is the charge-response contribution a fixed-charge Ewald
-implementation misses; without it the LES force increment is only 19–54 % of
-the reference at 1,002–1,500 atoms.
+> [!WARNING]
+> The last term is the charge-response contribution that a fixed-charge Ewald
+> implementation misses. Without it the LES force increment is only **19–54 %**
+> of the reference at 1,000–1,500 atoms — energies still match, forces do not.
 
 ## Measured speed
 
@@ -52,7 +63,7 @@ arm (us/atom/step, min / median):
 | atoms | MACELES (LES on) | backbone (LES off) | LES overhead |
 |---:|---:|---:|---:|
 | ~1,000 | 5.09 / 5.42 | 3.66 / 4.01 | +39 % |
-| ~1,500 | **5.37 / 5.71** | 4.46 / 5.40 | +20 % |
+| **~1,500** | **5.37 / 5.71** | 4.46 / 5.40 | **+20 %** |
 | ~5,000 | **4.22 / 4.23** | 2.73 / 2.79 | +54 % |
 
 3,000-atom boxes of several molecular species: **6.6-7.9 us/atom/step**
@@ -62,9 +73,10 @@ Sustained run, 3,000-atom box, 0.5 fs: **22.9 ms/step = 7.6 us/atom/step**,
 so **1 ns takes about 12.7 h on one A100**.  The 1,500-atom box reaches 1 ns in
 about 4.5 h clean (5.3 h sustained).
 
-The LES share grows with box volume (reciprocal-space Ewald work) and shrinks
-with neighbour density, which is why the smaller dense box shows +20 % while
-the low-density 5,000-atom box shows +54 %.
+> [!NOTE]
+> The LES share grows with box volume (reciprocal-space Ewald work) and shrinks
+> with neighbour density — hence **+20 %** on the small dense box versus
+> **+54 %** on the low-density 5,000-atom box.
 
 ## Accuracy against the PyTorch reference
 
