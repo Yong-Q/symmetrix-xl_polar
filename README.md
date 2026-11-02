@@ -31,7 +31,7 @@ Two bugs fixed relative to a naive LES hookup:
 
 µs/atom/step, 15 × 20-step NVT samples per arm; min / median.
 
-| atoms | density (molecules/Å³) | MACELES-LES | backbone only | LES ratio |
+| atoms | density (molecules/Å³) | MACELES (LES on) | polar backbone (LES off) | LES overhead |
 |---:|---:|---:|---:|---:|
 | 1,002 | 0.020 | 5.09 / 5.42 | 3.66 / 4.01 | +39 % |
 | 1,500 | 0.0334 (water, 1 g/cm³) | **5.37 / 5.71** | 4.46 / 5.40 | +20 % |
@@ -71,7 +71,7 @@ gas molecules to ≤1.5e-3 meV/atom.
 ## Build
 
 ```bash
-git clone --recurse-submodules -b maceles-les \
+git clone --recurse-submodules -b les-polar \
     git@github.com:Yong-Q/symmetrix-xl_polar.git
 cd symmetrix-xl
 ./pair_symmetrix/install.sh <lammps-source>
