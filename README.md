@@ -1,4 +1,6 @@
-# LES + polar (MACELES)
+# symmetrix-polar-les
+
+LES + polar for Symmetrix-XL (the MACELES engine).
 
 This branch adds **Latent Ewald Summation (LES)** to the Symmetrix **polar**
 MACE path — the model that predicts per-atom latent charges — so the polar
