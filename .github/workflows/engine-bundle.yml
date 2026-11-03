@@ -1,0 +1,74 @@
+name: engine bundle release
+
+# Publishes the prebuilt engine bundle as a **GitHub Release asset** (it is not
+# committed as a git blob: 83 MB in the history would cost every clone).
+#
+#   tag:    git tag bundle-v0.1.1 && git push origin bundle-v0.1.1
+#   manual: Actions -> engine bundle release -> Run workflow (url / tag inputs)
+#
+# The tarball is fetched from BUNDLE_URL, checked against the committed
+# dist/*.sha256, unpacked, self-checked, and only then attached to the release.
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "tarball URL (empty = authoring repo, see DEFAULT_URL)"
+        required: false
+        default: ""
+      tag:
+        description: "release tag"
+        required: false
+        default: "bundle-v0.1.1"
+  push:
+    tags: ["bundle-v*"]
+
+permissions:
+  contents: write
+
+env:
+  DEFAULT_URL: https://media.githubusercontent.com/media/Yong-Q/test/main/dist/maceles-lmp-env-cu12.9.79-sm_80-20261102.tar.gz
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the bundle
+        run: |
+          set -euo pipefail
+          url="${{ github.event.inputs.url }}"
+          url=${url:-$DEFAULT_URL}
+          mkdir -p dist
+          echo "fetching $url"
+          curl -fL --retry 3 --retry-delay 5 -o "dist/$(basename "$url")" "$url"
+          cd dist && sha256sum -c ./*.sha256
+
+      - name: Self-check the bundle
+        run: |
+          set -euo pipefail
+          tar xzf dist/*.tar.gz -C /tmp
+          cd /tmp/maceles-lmp-env-*
+          sha256sum -c MANIFEST.sha256
+          cat BUILD_INFO.txt
+          test -x bin/lmp && test -x bin/lmp-run && test -f env.sh
+          head -c 4 bin/lmp | grep -q ELF
+          . ./env.sh
+          # a hosted runner has no GPU/toolkit: only cublas/cuda may be unresolved
+          missing=$(ldd bin/lmp | awk '/not found/{print $1}' \
+                    | grep -Ev '^lib(cublas|cublasLt|cuda)\.so' || true)
+          [ -z "$missing" ] || { echo "::error::missing libs: $missing"; exit 1; }
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: "Engine bundle ${{ github.event.inputs.tag || github.ref_name }}"
+          body: |
+            Unpack-and-run MACELES/LAMMPS engine (CUDA 12.9 runtime, sm_80):
+
+            ```bash
+            tar xzf maceles-lmp-env-*.tar.gz && cd maceles-lmp-env-*
+            . ./env.sh && examples/smoke/run.sh
+            ```
+          files: dist/*.tar.gz*

@@ -25,3 +25,4 @@ plans/
 /.codex-build/
 /.qualification-tmp/
 /wheelhouse/
+dist/*.tar.gz

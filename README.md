@@ -93,6 +93,28 @@ systems between 96 and 1,500 atoms (bulk boxes and isolated molecules):
 The largest deviation is on a small isolated molecule, where the per-atom
 reference forces are ~1 eV/A.
 
+## Prebuilt engine bundle (no build needed)
+
+The **`bundle-v0.1.1`** release ships `maceles-lmp-env-cu12.9.79-sm_80-20261102.tar.gz`,
+an **unpack-and-run** engine: LAMMPS `30Sep2026` + Kokkos/CUDA + this branch's
+`pair_style symmetrix/mace/float32/kk`, with the runtime libraries it needs,
+the MACELES-OFF weights + sm_80 JIT cubin, the sampling/post-processing
+pipeline, example decks and job templates.
+
+```bash
+wget https://github.com/Yong-Q/symmetrix-xl_polar/releases/download/bundle-v0.1.1/maceles-lmp-env-cu12.9.79-sm_80-20261102.tar.gz
+echo "bafd07104393acf42adb0a469a5475abffa245c481a22e0ad9b96174620c2d8a  maceles-lmp-env-cu12.9.79-sm_80-20261102.tar.gz" | sha256sum -c -
+tar xzf maceles-lmp-env-*.tar.gz && cd maceles-lmp-env-*
+. ./env.sh
+examples/smoke/run.sh        # 64 waters, 500 steps, ~30 s on one A100
+```
+
+Nodes need glibc ≥ 2.34, driver ≥ 525 and a CUDA-12 `libcublas.so.12`
+(`env.sh` finds it under `CUDA_HOME`, `/opt/matos-tools/cuda/*/lib64`,
+`/usr/local/cuda*/lib64`); everything else is inside the tarball. The cubin is
+specific to sm_80 — regenerate it with
+`symmetrix.cli.prepare_jit_device_artifact` for other architectures.
+
 ## Build
 
 ```bash

@@ -1,0 +1,32 @@
+# Volcengine veMLP task template: one queue004 A100, one density-scan shard.
+#
+#   volc ml_task submit -c jobs/q4_veMLP.yaml \
+#       --set TaskName=maceles-scan-shard1 \
+#       --set UserCodePath=/path/to/maceles-lmp-env-20261102-cu12.9-sm80/
+#
+# The code path above is uploaded to RemoteMountCodePath inside the container,
+# so the bundle lands at /root/code and the entry point can source env.sh.
+TaskName: "maceles-scan"
+Description: "MACELES-OFF LES density scan shard (packaged engine bundle)"
+Tags:
+    - "maceles"
+    - "density-scan"
+UserCodePath: "./maceles-lmp-env-20261102-cu12.9-sm80/"
+RemoteMountCodePath: "/root/code"
+Entrypoint: "bash /root/code/jobs/entrypoint_scan.sh"
+Envs:
+    - Name: "WORKDIR"
+      Value: "/vepfs-*/workspace-state/shared/bza/symmetrix-polar/bench/maceles_density_scan/shard_1"
+      IsPrivate: false
+    - Name: "MANIFEST"
+      Value: "/vepfs-*/workspace-state/shared/bza/symmetrix-polar/bench/maceles_density_scan/shard_1/attempt-01/manifest.csv"
+      IsPrivate: false
+ImageUrl: "cr-cn-beijing.volces.com/ml_platform/python:cuda12.2-ubuntu22.04"
+ResourceQueueName: "queue004"
+Framework: "Custom"
+TaskRoleSpecs:
+    - RoleName: "worker"
+      RoleReplicas: 1
+      Flavor: "ml.pni2.3xlarge"
+ActiveDeadlineSeconds: "24h"
+AccessType: "Public"
